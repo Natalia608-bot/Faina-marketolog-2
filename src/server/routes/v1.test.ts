@@ -1,0 +1,109 @@
+import { describe, it, expect, beforeAll } from "vitest";
+import type { Hono } from "hono";
+
+let app: Hono;
+
+beforeAll(async () => {
+  process.env.JWT_SECRET = "test-secret-at-least-32-characters-long";
+  process.env.ENCRYPTION_KEY =
+    "0000000000000000000000000000000000000000000000000000000000000001";
+  process.env.APP_URL = "http://localhost:3000";
+  process.env.CRON_SECRET = "test-cron-secret-at-least-32-characters-long";
+  process.env.DATABASE_URL = "postgresql://test:test@localhost:5433/replystack_dev";
+  const { buildApp } = await import("../app");
+  app = buildApp();
+});
+
+// Every v1 endpoint must be wired and reject unauthenticated requests with 401
+// before touching the database. This is the port-parity guard for B1.
+const ENDPOINTS: Array<[string, string]> = [
+  ["GET", "/api/v1/channels"],
+  ["GET", "/api/v1/channels/abc"],
+  ["PATCH", "/api/v1/channels/abc"],
+  ["DELETE", "/api/v1/channels/abc"],
+  ["POST", "/api/v1/channels/connect-token"],
+  ["POST", "/api/v1/channels/abc/gmail-filter"],
+  ["POST", "/api/v1/channels/abc/drain"],
+  ["GET", "/api/v1/channels/abc/posts"],
+  ["GET", "/api/v1/contacts"],
+  ["POST", "/api/v1/contacts"],
+  ["GET", "/api/v1/contacts/abc"],
+  ["PATCH", "/api/v1/contacts/abc"],
+  ["DELETE", "/api/v1/contacts/abc"],
+  ["GET", "/api/v1/conversations"],
+  ["GET", "/api/v1/conversations/abc"],
+  ["PATCH", "/api/v1/conversations/abc"],
+  ["GET", "/api/v1/conversations/abc/messages"],
+  ["POST", "/api/v1/conversations/abc/messages"],
+  ["GET", "/api/v1/rules"],
+  ["POST", "/api/v1/rules"],
+  ["GET", "/api/v1/rules/abc"],
+  ["PATCH", "/api/v1/rules/abc"],
+  ["DELETE", "/api/v1/rules/abc"],
+  ["GET", "/api/v1/sequences"],
+  ["POST", "/api/v1/sequences"],
+  ["GET", "/api/v1/sequences/abc"],
+  ["PATCH", "/api/v1/sequences/abc"],
+  ["DELETE", "/api/v1/sequences/abc"],
+  ["POST", "/api/v1/sequences/abc/enroll"],
+  ["GET", "/api/v1/api-keys"],
+  ["POST", "/api/v1/api-keys"],
+  ["DELETE", "/api/v1/api-keys/abc"],
+  ["GET", "/api/v1/audit-log"],
+  ["POST", "/api/v1/messages/prune"],
+  ["POST", "/api/v1/webhook-events/prune"],
+  ["GET", "/api/v1/workspace"],
+  ["PATCH", "/api/v1/workspace"],
+  ["GET", "/api/v1/tags"],
+  ["POST", "/api/v1/tags"],
+  ["PATCH", "/api/v1/tags/abc"],
+  ["DELETE", "/api/v1/tags/abc"],
+  ["GET", "/api/v1/webhooks"],
+  ["POST", "/api/v1/webhooks"],
+  ["GET", "/api/v1/webhooks/abc"],
+  ["PATCH", "/api/v1/webhooks/abc"],
+  ["DELETE", "/api/v1/webhooks/abc"],
+  ["POST", "/api/v1/webhooks/abc/rotate-secret"],
+  // Publishing wing + remaining routes — every v1 endpoint must reject unauthenticated requests.
+  ["GET", "/api/v1/posts"],
+  ["POST", "/api/v1/posts"],
+  ["GET", "/api/v1/posts/abc"],
+  ["PATCH", "/api/v1/posts/abc"],
+  ["DELETE", "/api/v1/posts/abc"],
+  ["POST", "/api/v1/posts/abc/publish"],
+  ["POST", "/api/v1/media"],
+  ["GET", "/api/v1/brands"],
+  ["POST", "/api/v1/brands"],
+  ["PATCH", "/api/v1/brands/abc"],
+  ["DELETE", "/api/v1/brands/abc"],
+  ["GET", "/api/v1/content"],
+  ["POST", "/api/v1/content"],
+  ["GET", "/api/v1/content/abc"],
+  ["PATCH", "/api/v1/content/abc"],
+  ["DELETE", "/api/v1/content/abc"],
+  ["GET", "/api/v1/sources"],
+  ["POST", "/api/v1/sources"],
+  ["DELETE", "/api/v1/sources/abc"],
+  ["POST", "/api/v1/sources/abc/sync"],
+  ["GET", "/api/v1/approvals"],
+  ["POST", "/api/v1/approvals/abc/approve"],
+  ["POST", "/api/v1/approvals/abc/reject"],
+  ["GET", "/api/v1/license"],
+  ["POST", "/api/v1/license"],
+  ["DELETE", "/api/v1/license"],
+  ["GET", "/api/v1/stats/response-times"],
+  ["POST", "/api/v1/channels/telegram/connect"],
+  ["DELETE", "/api/v1/sequences/abc/enrollments/abc"],
+];
+
+describe("v1 routes — wired + auth-gated", () => {
+  it.each(ENDPOINTS)("%s %s returns 401 without auth", async (method, path) => {
+    const res = await app.request(path, {
+      method,
+      headers: { "content-type": "application/json" },
+      body: method === "GET" || method === "DELETE" ? undefined : "{}",
+    });
+    expect(res.status).toBe(401);
+    expect(res.headers.get("access-control-allow-origin")).toBe("*");
+  });
+});

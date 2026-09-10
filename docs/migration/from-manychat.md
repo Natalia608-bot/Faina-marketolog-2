@@ -1,0 +1,141 @@
+# Migrating from ManyChat (and Chatfuel)
+
+ManyChat charges a subscription that grows with your contact count. PostStack is self-hosted: your
+subscribers, tags, and automations live on your own server with no per-contact fee. This guide covers what
+to bring over and how.
+
+Migration from ManyChat has three parts:
+
+1. **Subscribers & tags** — exportable as CSV, brought into your CRM.
+2. **Automations / flows** — *not* exportable; rebuilt as PostStack rules & sequences (see
+   [rebuild-automations.md](rebuild-automations.md)).
+3. **Conversation history** — not migratable (ManyChat exports the current contact state, not full threads).
+
+> The CRM (contacts & tags) is a **Pro** feature. The endpoints below require a Pro license.
+
+## 1. Export your audience
+
+In ManyChat (paid plans): **Audience tab → Export → CSV**. The file typically includes the Instagram
+handle, email (if captured), tags, and any custom fields. ManyChat only stores the most recent opt-in
+event, so you get the contact's current state, not its history.
+
+> Confirm the current export steps in ManyChat's own help docs — their UI changes over time.
+
+A typical row:
+
+```csv
+Name,Instagram Username,Email,Subscribed,Tags,City
+Anna K,annak_design,anna@example.com,true,"customer,vip",Warsaw
+```
+
+## 2. Field mapping
+
+| CSV column | PostStack target | Notes |
+|------------|------------------|-------|
+| Name | `contacts.display_name` | |
+| Email | `contacts.email` | |
+| Instagram Username / Handle | `contact_channels.platform_username` | Bound to the Instagram channel you pick. |
+| Subscribed / Opt-in status | `contacts.is_subscribed` | |
+| Tags (comma-separated) | `tags` + `contact_tags` | Tags are auto-created on import. |
+| Any other column | `contacts.metadata` (JSON) | Custom fields are preserved as key/value. |
+
+### A note on addressability
+
+ManyChat exports the Instagram **handle**, not the numeric Instagram-scoped sender id that Meta requires to
+send a DM. So an imported contact starts as a CRM record keyed by its handle; it becomes fully addressable
+for auto-replies the first time it interacts with you (the inbound webhook matches the handle and fills in
+the real sender id). Your tags, fields, and segments are intact from day one — outbound DM to a
+never-interacted imported contact is the only thing that waits for that first touch.
+
+## 3. Recreate your tags
+
+Tags can be imported today via `POST /api/v1/tags` (`tags:write` scope, Pro):
+
+```bash
+curl -s -X POST https://your-instance/api/v1/tags \
+  -H "Authorization: Bearer sk_live_your_key" -H "Content-Type: application/json" \
+  -d '{ "name": "vip", "color": "#6366f1" }'
+```
+
+## 4. Import the subscribers
+
+Push the audience in with `POST /api/v1/contacts` (scope `contacts:write`, Pro). It accepts one contact or
+an array (up to 1000 per request) and is idempotent — re-running updates instead of duplicating (dedup on
+channel + handle), and `metadata` is merged so a re-import never clobbers existing custom fields:
+
+```bash
+curl -s -X POST https://your-instance/api/v1/contacts \
+  -H "Authorization: Bearer sk_live_your_key" -H "Content-Type: application/json" \
+  -d '[
+    {
+      "channel_id": "<your IG channel id>",
+      "platform_username": "annak_design",
+      "display_name": "Anna K",
+      "email": "anna@example.com",
+      "is_subscribed": true,
+      "metadata": { "city": "Warsaw" },
+      "tags": ["customer", "vip"]
+    }
+  ]'
+# → { "data": { "created": 1, "updated": 0, "failed": 0, "results": [ { "index": 0, "status": "created", "contact_id": "…" } ] } }
+```
+
+Tags are created automatically; rows with an unknown channel are reported in `results` (not fatal).
+
+### One pass with the reference script
+
+[`import-contacts.mjs`](import-contacts.mjs) reads the audience CSV, maps the columns above (unknown
+columns become `metadata`), and POSTs in batches:
+
+```bash
+export POSTSTACK_URL="https://your-instance"
+export POSTSTACK_KEY="sk_live_your_key"
+export POSTSTACK_CHANNEL_ID="<your IG channel id>"
+node docs/migration/import-contacts.mjs path/to/audience.csv
+```
+
+## 5. Rebuild your automations
+
+> **First, connect the Instagram account for DMs.** ManyChat's bread and butter is Instagram DM
+> automation, so connect that account via **Instagram Business Login** (the "+ Instagram (messaging)"
+> button on the Channels page). This is the path that **receives and replies to Instagram DMs** — it
+> runs at Meta **Standard Access** (no App Review), needs **no Facebook page**, and requires
+> `INSTAGRAM_APP_ID` / `INSTAGRAM_APP_SECRET` set on your instance. (A Facebook/System-User connection
+> bulk-connects IG accounts for publishing and comments, but **not** DMs at Standard Access.)
+
+This is the part people worry about most, and it's usually quick. See
+[rebuild-automations.md](rebuild-automations.md) for a side-by-side of common ManyChat flow patterns
+(keyword → DM, comment → DM, story reply) and how to express each as a PostStack rule or sequence.
+
+## 6. Stay in sync with your other tools (webhooks)
+
+If you pipe new subscribers into a CRM, an email tool, or a spreadsheet, you don't have to poll. Register
+an outbound webhook (`webhooks:write` scope, Pro) and PostStack will POST you a signed event the moment a
+new contact is created — whether from an import, a fresh DM, or a comment:
+
+```bash
+curl -s -X POST https://your-instance/api/v1/webhooks \
+  -H "Authorization: Bearer sk_live_your_key" -H "Content-Type: application/json" \
+  -d '{ "url": "https://your-app.example.com/hooks/poststack", "event_types": ["contact.created"] }'
+# → { "data": { "id": "…", "secret": "whsec_…", "event_types": ["contact.created"], "active": true } }
+```
+
+The response includes the signing `secret` **once** — store it. Every delivery carries
+`X-PostStack-Signature: t=<unix>,v1=<hmac>` (HMAC-SHA256 over `"<timestamp>.<raw-body>"`), so your
+receiver can verify authenticity and reject replays. Omit `event_types` (or pass `[]`) to receive every
+event type; rotate the secret any time with `POST /api/v1/webhooks/{id}/rotate-secret`. Full schema at
+`/api/docs`.
+
+The delivery body is an event envelope; `data.id` is the subject's id, so you can fetch the full record
+from the REST API:
+
+```json
+{
+  "id": "<event id>",
+  "type": "contact.created",
+  "created_at": "2026-06-25T12:00:00.000Z",
+  "data": { "id": "<contact id>", "type": "contact" }
+}
+```
+
+So on `contact.created` you'd call `GET /api/v1/contacts/{data.id}` for the full contact.

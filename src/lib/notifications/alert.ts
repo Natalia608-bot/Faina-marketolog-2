@@ -1,0 +1,140 @@
+import { rateLimit } from "@/lib/api/rate-limit";
+import { getConfig } from "@/lib/settings/config";
+import { getAlertWebhook } from "./alert-webhook";
+import { buildCustomizedBody, type PlaceholderContext } from "@/lib/webhooks/payload-customization";
+import { safeFetchWebhook } from "@/lib/webhooks/safe-target";
+import { SsrfError } from "@/lib/net/safe-fetch";
+
+/** Alert classes carried on the `type` discriminator. A single outbound webhook receives them all;
+ *  the operator routes by `type` on their side (Telegram / n8n / Slack). */
+export type AlertType =
+  | "channel_reauth"
+  | "channel_reauth_urgent" // final higher-priority nudge ~24h before a needs_reauth channel hard-expires
+  | "channel_degraded" // still active but impaired (e.g. publishes but can't receive a class of events)
+  | "delivery_failed"
+  | "delivery_held"
+  | "event_error"
+  | "token_expiring"; // proactive: a managed connection / token nears its data-access wall or expiry
+
+export interface Alert {
+  type: AlertType;
+  /** The channel the alert concerns, when applicable (used for throttle scoping + payload). */
+  channelId?: string;
+  /** The managed source the alert concerns (token_expiring on a master); scopes the throttle too. */
+  sourceId?: string;
+  workspaceId?: string;
+  platform?: string;
+  displayName?: string | null;
+  /** Human-readable reason / error detail. Never a secret. */
+  detail?: string;
+  /** For token_expiring: when access ends + how many whole days remain (for templating/routing). */
+  expiresAt?: string;
+  daysLeft?: number;
+}
+
+/** One alert per (type, channel) per this window — a dead channel emitting hundreds of failed
+ *  deliveries collapses into a single alert per failure-class until the window rolls over. */
+export const ALERT_THROTTLE_WINDOW_SECONDS = 15 * 60; // 15 minutes
+
+/**
+ * Whether this alert is currently suppressed by the throttle. The first alert of a given
+ * (type, channel) in the window passes; the rest are dropped until the window rolls over. An alert
+ * with no channel scopes the throttle by type alone. Best-effort: if the throttle store errors,
+ * fail OPEN (allow the alert) — a missed suppression is better than a missed alert.
+ */
+async function isThrottled(alert: Alert): Promise<boolean> {
+  const key = `alert:${alert.type}:${alert.channelId ?? alert.sourceId ?? "-"}`;
+  try {
+    const { allowed } = await rateLimit(key, 1, ALERT_THROTTLE_WINDOW_SECONDS);
+    return !allowed;
+  } catch {
+    return false;
+  }
+}
+
+/** The standard alert body (every field the operator can select / template against). */
+function standardBody(alert: Alert): Record<string, unknown> {
+  return {
+    type: alert.type,
+    channel_id: alert.channelId,
+    source_id: alert.sourceId,
+    workspace_id: alert.workspaceId,
+    platform: alert.platform,
+    display_name: alert.displayName,
+    detail: alert.detail,
+    expires_at: alert.expiresAt,
+    days_left: alert.daysLeft,
+    app_url: process.env.APP_URL,
+  };
+}
+
+/** Flatten the standard body into a {{placeholder}} context (string leaves only). */
+function placeholderContext(body: Record<string, unknown>): PlaceholderContext {
+  const ctx: PlaceholderContext = {};
+  for (const [k, v] of Object.entries(body)) {
+    if (v === undefined || v === null) ctx[k] = "";
+    else ctx[k] = String(v);
+  }
+  return ctx;
+}
+
+/**
+ * Dispatch an operational alert. One webhook carries every alert class, discriminated by `type`.
+ *
+ * Resolution order:
+ *  1. the alert's workspace has a configured + enabled `alert_webhooks` row → POST the customized
+ *     body (field selection + {{placeholder}} extra fields) with its (decrypted) custom headers —
+ *     so it can target your email service (SES/SMTP) / Slack / n8n. This is the PRO path.
+ *  2. otherwise the global env `CHANNEL_ALERT_WEBHOOK_URL` (the license-ungated self-host fallback —
+ *     still SSRF-guarded at delivery), plain body.
+ *
+ * Throttled per (type, channel|source) so a persistent failure can't storm. Best-effort: never
+ * throws. Delivery goes through the shared secure-by-default webhook guard, which resolves DNS and
+ * refuses a private/loopback target by default (allowed only with WEBHOOK_ALLOW_PRIVATE_TARGETS) and
+ * always refuses metadata/link-local — a refused or failed alert must not break the worker.
+ */
+export async function dispatchAlert(alert: Alert): Promise<void> {
+  const body = standardBody(alert);
+
+  // Per-workspace customized webhook takes precedence over the env fallback.
+  let target: { url: string; headers: Record<string, string>; payload: Record<string, unknown> } | null = null;
+  if (alert.workspaceId) {
+    try {
+      const cfg = await getAlertWebhook(alert.workspaceId);
+      if (cfg && cfg.enabled && cfg.url) {
+        target = {
+          url: cfg.url,
+          headers: { "Content-Type": "application/json", ...cfg.headers },
+          payload: buildCustomizedBody(body, { field_selection: cfg.fieldSelection, extra_payload_fields: cfg.extraFields }, placeholderContext(body)),
+        };
+      }
+    } catch {
+      // config read failed — fall through to the env fallback rather than dropping the alert.
+    }
+  }
+  if (!target) {
+    const url = await getConfig("CHANNEL_ALERT_WEBHOOK_URL");
+    if (!url) return;
+    target = { url, headers: { "Content-Type": "application/json" }, payload: body };
+  }
+
+  if (await isThrottled(alert)) return;
+
+  try {
+    // safeFetchWebhook runs the secure-by-default webhook SSRF policy (resolves DNS; public only,
+    // private/loopback/cgnat only with WEBHOOK_ALLOW_PRIVATE_TARGETS; metadata/link-local always
+    // blocked) on the operator-configured URL via the rebinding-safe pinned connector (rejects 3xx).
+    // It asserts the target before connecting, so a disallowed URL throws SsrfError here — we skip.
+    await safeFetchWebhook(target.url, {
+      method: "POST",
+      headers: target.headers,
+      body: JSON.stringify(target.payload),
+      signal: AbortSignal.timeout(10_000),
+    });
+  } catch (err) {
+    if (err instanceof SsrfError) {
+      console.warn("Alert webhook target refused by the SSRF guard (private/metadata?) — skipping alert");
+    }
+    // Best-effort — a refused or failed notification must never break the worker.
+  }
+}

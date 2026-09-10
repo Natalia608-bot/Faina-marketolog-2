@@ -1,0 +1,84 @@
+import { describe, it, expect, vi, beforeAll, beforeEach } from "vitest";
+
+// resolveReplyContent runs the AI-rephrase path: workspace LLM budget + output clamp
+//. Mock the LLM call and the rate limiter so this is a pure unit test (no network/db).
+const rephrase = vi.fn(async (_workspaceId: string, t: string, _opts?: unknown) => t);
+vi.mock("@/lib/ai/rephrase", () => ({ rephrase: (...a: unknown[]) => rephrase(...(a as [string, string, unknown])) }));
+const rateLimit = vi.fn(async () => ({ allowed: true, remaining: 1, retryAfter: 0 }));
+vi.mock("@/lib/api/rate-limit", () => ({ rateLimit: (...a: unknown[]) => rateLimit(...(a as [])) }));
+// AIPROMPT1: resolveDmText reads the workspace-default rephrase prompt; stub it (no DB in this unit
+// test). `null` → no workspace override, so the resolver falls back to rule/tone/built-in default.
+const wsRephrasePrompt = vi.fn<() => string | null>(() => null);
+vi.mock("@/lib/db", () => ({
+  db: { query: { workspaces: { findFirst: async () => ({ ai_rephrase_prompt: wsRephrasePrompt() }) } } },
+}));
+
+let resolveReplyContent: typeof import("./executor").resolveReplyContent;
+const WS = "ws-aud162";
+
+beforeAll(async () => {
+  process.env.JWT_SECRET = "test-secret-at-least-32-characters-long";
+  process.env.ENCRYPTION_KEY = "0000000000000000000000000000000000000000000000000000000000000001";
+  process.env.APP_URL = "http://localhost:3000";
+  process.env.CRON_SECRET = "test-cron-secret-at-least-32-characters-long";
+  process.env.DATABASE_URL = "postgresql://test:test@localhost:5433/test";
+  ({ resolveReplyContent } = await import("./executor"));
+});
+
+beforeEach(() => {
+  rephrase.mockReset().mockImplementation(async (_ws: string, t: string) => t);
+  rateLimit.mockReset().mockResolvedValue({ allowed: true, remaining: 1, retryAfter: 0 });
+});
+
+describe("AI-rephrase per-workspace budget", () => {
+  it("calls the LLM (keyed per workspace) when under budget", async () => {
+    rephrase.mockResolvedValueOnce("rephrased!");
+    const content = await resolveReplyContent(WS, "ai_rephrase", { text: "hello" });
+    expect(rateLimit).toHaveBeenCalledWith(`rl:llm:${WS}`, expect.any(Number), 86_400);
+    expect(rephrase).toHaveBeenCalledTimes(1);
+    expect(content?.text).toBe("rephrased!");
+  });
+
+  it("passes the workspace-default rephrase prompt + the rule overrides through to rephrase() (AIPROMPT1)", async () => {
+    wsRephrasePrompt.mockReturnValueOnce("WS default rephrase prompt");
+    await resolveReplyContent(WS, "ai_rephrase", { text: "hello", custom_prompt: "rule prompt", tone: "blunt" });
+    expect(rephrase).toHaveBeenCalledTimes(1);
+    expect(rephrase.mock.calls[0]![0]).toBe(WS); // ADLOG1: workspaceId forwarded for the generation log
+    // The executor must forward the workspace prompt (loaded from the DB) + the rule's overrides — the
+    // resolver (unit-tested separately) then applies precedence. Dropping any of these regresses here.
+    expect(rephrase.mock.calls[0]![2]).toMatchObject({
+      workspacePrompt: "WS default rephrase prompt",
+      customPrompt: "rule prompt",
+      tone: "blunt",
+    });
+  });
+
+  it("fails soft to the operator base text WITHOUT an LLM call once over budget", async () => {
+    rateLimit.mockResolvedValueOnce({ allowed: false, remaining: 0, retryAfter: 60 });
+    const content = await resolveReplyContent(WS, "ai_rephrase", { text: "hello" });
+    expect(rephrase).not.toHaveBeenCalled();
+    expect(content?.text).toBe("hello");
+  });
+
+  it("does not touch the LLM budget for a non-AI rule", async () => {
+    const content = await resolveReplyContent(WS, "text", { text: "plain" });
+    expect(rateLimit).not.toHaveBeenCalled();
+    expect(rephrase).not.toHaveBeenCalled();
+    expect(content?.text).toBe("plain");
+  });
+});
+
+describe("AI-rephrase output clamp", () => {
+  it("clamps an overlong + control-char LLM completion to the write-side bound", async () => {
+    rephrase.mockResolvedValueOnce("A".repeat(5000) + "\u0000\u0007bad");
+    const content = await resolveReplyContent(WS, "ai_rephrase", { text: "hi" });
+    expect([...(content!.text as string)].length).toBeLessThanOrEqual(2000);
+    expect(content!.text).not.toMatch(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/);
+  });
+
+  it("keeps tab/newline and ordinary text intact", async () => {
+    rephrase.mockResolvedValueOnce("line one\nline\ttwo");
+    const content = await resolveReplyContent(WS, "ai_rephrase", { text: "hi" });
+    expect(content!.text).toBe("line one\nline\ttwo");
+  });
+});

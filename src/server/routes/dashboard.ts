@@ -1,0 +1,4063 @@
+import type { Hono, MiddlewareHandler, Context } from "hono";
+import { every } from "hono/combine";
+import { html, raw } from "hono/html";
+import type { HtmlEscapedString } from "hono/utils/html";
+import { and, or, eq, ne, gt, gte, lt, asc, desc, ilike, like, exists, inArray, isNull, isNotNull, sql, count, type SQL } from "drizzle-orm";
+import { db } from "@/lib/db";
+import {
+  conversations, messages, messageReactions, postReactions, channels, contacts, contactChannels,
+  apiKeys as apiKeysTbl, autoReplyRules, sequences as sequencesTbl, sequenceEnrollments, workspaces,
+  pendingApprovals, commentLogs, events as eventsTbl, webhookEvents, webhookEventStats, postReactionStats, users,
+  posts, content,
+  type ConversationThreadType,
+} from "@/db/schema";
+import { mergeWebhookStatusCounts, mergePostReactionTotals } from "@/lib/history/stats-read";
+import { createTtlCache } from "@/lib/cache/ttl-cache";
+import { messagingWindowState } from "@/lib/platforms/messaging-window";
+import { hashPassword, verifyPassword } from "@/lib/auth/password";
+import { authenticate, type AuthContext } from "@/lib/auth";
+import { truncateCodePoints } from "@/lib/text";
+import type { StoredAttachments } from "@/lib/messages/attachments";
+import { MAX_RETENTION_DAYS } from "@/lib/retention";
+import { env } from "@/lib/env";
+import { BRAND } from "@/lib/brand";
+import { icon } from "../ui/components/icons";
+import { toastHeader } from "../ui/components/toast";
+import { timeAgo } from "../ui/components/time";
+import { proLink } from "../ui/components/pro-link";
+import { addJobTx } from "@/lib/queue/client";
+import { platformCell, platformColor, platformGlyph, platformGlyphString, platformLabel } from "../ui/components/platform";
+import { t } from "@/lib/i18n";
+import { getInstanceLicense, setLicense, clearLicense, licenseRejectionMessage, type LicenseState } from "@/lib/license/gate";
+import { configStatus, setConfig, clearConfig, type ConfigStatus } from "@/lib/settings/config";
+import { CONFIG_KEYS } from "@/lib/settings/registry";
+import { getAlertWebhook, upsertAlertWebhook, deleteAlertWebhook, type AlertWebhookConfig } from "@/lib/notifications/alert-webhook";
+import { parseHeaderLines } from "@/lib/webhooks/header-map";
+import { buildDraftContext } from "@/lib/ai/draft-context";
+import { loadAiGenerationLogs, renderAiGenerationLogs } from "../ui/sections/ai-generation-logs";
+import type { Feature } from "@/lib/license/features";
+import { loadOverview } from "@/lib/stats/overview";
+import { getResponseTimeStats, formatLatencyMs, DEFAULT_WINDOW_DAYS, type ResponseTimeStats } from "@/lib/metrics/response-times";
+import * as channelConnectToken from "@/server/handlers/v1/channels/connect-token/route";
+import * as channelTelegram from "@/server/handlers/v1/channels/telegram/route";
+import * as conversationMessages from "@/server/handlers/v1/conversations/[conversationId]/messages/route";
+import * as conversation from "@/server/handlers/v1/conversations/[conversationId]/route";
+import * as rules from "@/server/handlers/v1/rules/route";
+import * as rule from "@/server/handlers/v1/rules/[ruleId]/route";
+import * as approvalApprove from "@/server/handlers/v1/approvals/[approvalId]/approve/route";
+import * as approvalReject from "@/server/handlers/v1/approvals/[approvalId]/reject/route";
+import type { ProposedContent } from "@/lib/approvals/draft";
+import * as sequences from "@/server/handlers/v1/sequences/route";
+import * as sequence from "@/server/handlers/v1/sequences/[sequenceId]/route";
+import * as apiKeys from "@/server/handlers/v1/api-keys/route";
+import * as apiKey from "@/server/handlers/v1/api-keys/[keyId]/route";
+import { dashboardDoc } from "../ui/layout";
+import { requireSameOrigin } from "../middleware/same-origin";
+import { registerChannels } from "../ui/sections/channels";
+import { registerCompose } from "../ui/sections/compose";
+import { registerContent } from "../ui/sections/content";
+import { registerBrands } from "../ui/sections/brands";
+import { listBrands, type BrandRow } from "@/lib/brands/service";
+import { loadSubscriptionStatuses, reconcileChannelSubscription, type ChannelSubscriptionStatus } from "@/lib/channels/subscription-status";
+import { btn } from "../ui/components/button";
+import { registerSources, renderSourcesManager } from "../ui/sections/sources";
+import { registerQueue } from "../ui/sections/queue";
+import { registerWebhooksOutbound, outboundWebhooksMount } from "../ui/sections/webhooks-outbound";
+import { DEFAULT_REPHRASE_PROMPT, DEFAULT_REPHRASE_TONE } from "@/lib/ai/rephrase";
+import { DEFAULT_DRAFT_PROMPT } from "@/lib/ai/draft";
+import { isAiConfigured } from "@/lib/ai/client";
+import {
+  API_SCOPE_DEFINITIONS,
+  API_SCOPE_GROUPS,
+  API_SCOPE_PRESETS,
+  API_SCOPES,
+} from "@/lib/auth/scopes";
+import { aiUnconfiguredBanner } from "../ui/components/ai-notice";
+import { gatherAttention, upcomingScheduled, recentEvents, type AttentionRow, type UpcomingPost, type RecentEvent } from "../ui/sections/dashboard-data";
+import { dot, pill as pillBadge, statusBadge, type Tone } from "../ui/components/status";
+import { kpi } from "../ui/components/kpi";
+import { listProviders } from "@/lib/providers";
+
+type Html = HtmlEscapedString | Promise<HtmlEscapedString>;
+
+// ─── helpers ──────────────────────────────────────────────────────────────────
+
+async function auth(c: Context): Promise<AuthContext | null> {
+  return authenticate(c.req.raw).catch(() => null);
+}
+
+/** Build a JSON Request carrying the caller's cookie/Authorization, for delegating
+ * to an API handler that expects a structured JSON body. */
+function jsonReq(c: Context, body: unknown): Request {
+  const headers = new Headers({ "content-type": "application/json" });
+  const cookie = c.req.header("cookie");
+  const authz = c.req.header("authorization");
+  if (cookie) headers.set("cookie", cookie);
+  if (authz) headers.set("authorization", authz);
+  return new Request(c.req.url, { method: "POST", headers, body: JSON.stringify(body) });
+}
+
+
+/** Wall-clock HH:MM for a message's own timestamp — the mono time under each thread bubble. */
+function clockTime(iso: string | Date | null): string {
+  if (!iso) return "";
+  return new Date(iso).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+/** Compact date + time for an email card header (no relative fuzzing — emails are dated, not "5m ago"). */
+function emailWhen(iso: string | Date | null): string {
+  if (!iso) return "";
+  return new Date(iso).toLocaleString([], { day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit", hour12: false });
+}
+
+// ─── inbox ────────────────────────────────────────────────────────────────────
+
+type ConvName = {
+  contact: { display_name: string | null; contact_channels: Array<{ platform_username: string | null; platform_sender_id: string }> };
+};
+function contactName(c: ConvName): string {
+  return (
+    c.contact.display_name ??
+    c.contact.contact_channels[0]?.platform_username ??
+    c.contact.contact_channels[0]?.platform_sender_id ??
+    "Unknown"
+  );
+}
+
+/** The contact's platform handle (username, else the raw sender id) — the address shown in the thread
+ *  header's "via …" line. Instagram handles get the conventional "@" prefix; emails/usernames pass
+ *  through unchanged (we don't store decorated handles like "fb.com/…", so we don't fabricate them). */
+function contactHandle(c: ConvName & { platform: string }): string {
+  const raw = c.contact.contact_channels[0]?.platform_username ?? c.contact.contact_channels[0]?.platform_sender_id ?? "";
+  if (!raw) return "";
+  return c.platform === "instagram" && !raw.startsWith("@") ? `@${raw}` : raw;
+}
+
+/** Two initials for an avatar bubble (the contact's name, falling back to "?"). */
+function initialsOf(name: string): string {
+  return (name.match(/\b\w/g) ?? ["?"]).slice(0, 2).join("").toUpperCase();
+}
+
+/** The "via {Platform} · {handle}" line under the thread title: a brand glyph (mail icon for email)
+ *  + the platform label + the contact's handle. Mirrors the prototype's `.th-via`. */
+function platformVia(conv: ConvName & { platform: string }): Html {
+  const handle = contactHandle(conv);
+  const isEmail = conv.platform === "gmail";
+  const glyph = isEmail ? icon("mail", "ico", 12) : platformGlyph(conv.platform, 12);
+  const label = isEmail ? "Gmail" : platformLabel(conv.platform);
+  return html`${glyph}<span>via ${label}${handle ? html` · ${handle}` : html``}</span>`;
+}
+
+const CONV_QUERY = {
+  columns: {
+    id: true, platform: true, status: true, last_message_at: true,
+    last_message_preview: true, unread_count: true, thread_type: true, thread_ref: true,
+    // Surfaced as inbox controls / indicators.
+    is_automation_paused: true, needs_manual_reply: true, assigned_to: true,
+    // Meta 24h-window anchor — drives the composer window indicator.
+    last_inbound_at: true,
+    // Email thread subject line (gmail only).
+    subject: true,
+  },
+  with: {
+    channel: { columns: { id: true, display_name: true, platform: true } },
+    contact: {
+      columns: { id: true, display_name: true, avatar_url: true },
+      with: { contact_channels: { columns: { platform_sender_id: true, platform_username: true }, limit: 1 } },
+    },
+  },
+} as const;
+
+export type ConvFilter = "open" | "needs_reply" | "unread" | "dm" | "comment" | "done";
+const CONV_FILTERS: { id: ConvFilter; label: string }[] = [
+  { id: "open", label: "Open" },
+  { id: "needs_reply", label: "Needs reply" },
+  { id: "unread", label: "Unread" },
+  { id: "dm", label: "DMs" },
+  { id: "comment", label: "Comments" },
+  { id: "done", label: "Done" },
+];
+export function parseConvFilter(v: string | undefined): ConvFilter {
+  return CONV_FILTERS.some((f) => f.id === v) ? (v as ConvFilter) : "open";
+}
+
+/** Just the conversation rows (htmx swaps this when a filter tab is clicked). */
+function renderConvItems(conversations: Array<Awaited<ReturnType<typeof loadConversations>>[number]>): Html {
+  if (conversations.length === 0) {
+    return html`<p class="muted" style="padding:1rem">Nothing here. Try another filter, or wait for new activity.</p>`;
+  }
+  return html`${conversations.map((conv) => {
+    const isComment = conv.thread_type === "comment";
+    const isEmail = conv.thread_type === "email";
+    const kind = isComment ? { cls: "comment", ic: "comment" as const, t: "Comment" } : isEmail ? { cls: "email", ic: "mail" as const, t: "Email" } : { cls: "dm", ic: "comment" as const, t: "DM" };
+    const name = contactName(conv);
+    const initials = (name.match(/\b\w/g) ?? ["?"]).slice(0, 2).join("").toUpperCase();
+    return html`<button class="conv-item ${conv.unread_count > 0 ? "unread" : ""}" hx-get="/inbox/${conv.id}" hx-target="#thread" hx-swap="innerHTML">
+      <span class="conv-av"><span class="conv-av-i">${initials}</span><span class="conv-pg" style="background:${platformColor(conv.platform)}">${raw(platformGlyphString(conv.platform, 9))}</span></span>
+      <span class="conv-body">
+        <span class="conv-top"><span class="conv-name">${name}</span><span class="conv-time-wrap">${conv.unread_count > 0 ? html`<span class="conv-unread" title="${conv.unread_count} unread"></span>` : html``}<span class="conv-time">${timeAgo(conv.last_message_at)}</span></span></span>
+        ${isEmail ? html`<span class="conv-subject">${conv.subject ?? "(no subject)"}</span>` : html``}
+        <span class="conv-preview">${conv.last_message_preview ?? "No messages"}</span>
+        <span class="conv-meta">
+          <span class="conv-kind conv-kind-${kind.cls}">${icon(kind.ic, "ico", 11)} ${kind.t}</span>
+          ${conv.status !== "open"
+            ? html`<span class="conv-kind">${dot(conv.status === "closed" ? "ok" : "neutral")} ${conv.status === "closed" ? "Done" : "Snoozed"}</span>`
+            : html``}
+          ${conv.needs_manual_reply ? html`<span class="conv-flag">${icon("alert", "ico", 11)} Needs reply</span>` : html``}
+        </span>
+      </span>
+    </button>`;
+  })}`;
+}
+
+type InboxChannel = Awaited<ReturnType<typeof loadInboxChannels>>[number];
+
+/** The inbox left panel: filter tabs + a channel dropdown + the rows. Tabs carry the current channel
+ *  and the dropdown carries the current filter, and both re-render the whole panel (#conv-panel), so
+ *  the two filters compose and their selected state always stays in sync. */
+function renderConvPanel(
+  conversations: Array<Awaited<ReturnType<typeof loadConversations>>[number]>,
+  filter: ConvFilter,
+  channelId: string,
+  chans: InboxChannel[],
+  contactId = "all",
+  search = "",
+  since = "",
+  from = "",
+  to = "",
+  doneCount = 0,
+): Html {
+  // One form holds every filter (pills, contact-name search, date preset/range, channel) so they
+  // always compose — any change re-runs /inbox/list with the full state. Pills drive a hidden
+  // `filter` via Alpine; selects fire on change; the search box on debounced keyup. Picking
+  // "Custom range…" reveals from/to date inputs (Alpine `since` mirrors the select).
+  const sinceOpt = (v: string, label: string) => html`<option value="${v}" ${since === v ? "selected" : ""}>${label}</option>`;
+  return html`<div class="conv-head" style="display:flex;justify-content:space-between;align-items:center">
+      <span>Inbox</span>
+      <button type="submit" form="conv-filter-form" class="btn btn-sm btn-ic" title="Refresh the list (also pulls the latest into view)">${icon("reconnect", "ico", 14)}</button>
+    </div>
+    <form id="conv-filter-form" class="conv-filters" x-data="{ filter: '${filter}', since: '${since}' }"
+      hx-get="/inbox/list" hx-target="#conv-panel" hx-swap="innerHTML"
+      hx-trigger="submit, change from:find select, change from:find input[type='date'], input changed delay:350ms from:find input[name='search']"
+      style="display:flex;flex-direction:column;gap:.4rem;padding:.45rem .5rem;border-bottom:1px solid var(--border)">
+      <input type="hidden" name="filter" :value="filter" />
+      <input type="hidden" name="contact" value="${contactId}" />
+      <div style="display:flex;gap:.25rem;flex-wrap:wrap">
+        ${CONV_FILTERS.map(
+          (f) => html`<button type="button" class="btn btn-sm" :class="{ 'btn-primary': filter==='${f.id}' }" style="font-size:.72rem;padding:.15rem .5rem"
+            @click="filter='${f.id}'; $nextTick(() => window.htmx.trigger($root, 'submit'))">${f.id === "done" && doneCount > 0 ? `${f.label} (${doneCount})` : f.label}</button>`,
+        )}
+      </div>
+      <div style="display:flex;gap:.35rem">
+        <input class="input input-sm" type="search" name="search" autocomplete="off" placeholder="Search contact name…" value="${search}" style="flex:1;min-width:0" />
+        <select class="input input-sm" name="since" title="Active since" x-model="since" style="flex:0 0 auto">
+          ${sinceOpt("", "Any time")}${sinceOpt("24h", "Last 24h")}${sinceOpt("7d", "Last 7 days")}${sinceOpt("30d", "Last 30 days")}${sinceOpt("90d", "Last 90 days")}${sinceOpt("custom", "Custom range…")}
+        </select>
+      </div>
+      <div x-show="since==='custom'" x-cloak class="row-center" style="gap:.35rem">
+        <input class="input input-sm" type="date" name="from" value="${from}" title="From" style="flex:1;min-width:0" />
+        <span class="muted" style="flex:0 0 auto">→</span>
+        <input class="input input-sm" type="date" name="to" value="${to}" title="To" style="flex:1;min-width:0" />
+      </div>
+      ${chans.length > 1
+        ? html`<select class="input input-sm" name="channel" style="width:100%">
+            <option value="all" ${channelId === "all" ? "selected" : ""}>All channels</option>
+            ${renderInboxChannelOptions(chans, channelId)}
+          </select>`
+        : html`<input type="hidden" name="channel" value="${channelId}" />`}
+    </form>
+    ${contactId !== "all"
+      ? html`<div class="conv-contact-chip">
+          <span class="muted">Filtered: <b>${conversations[0] ? contactName(conversations[0]) : "this contact"}</b></span>
+          <button type="button" class="btn btn-sm btn-ic" title="Clear contact filter — show everyone"
+            hx-get="/inbox/list?filter=${filter}&channel=${channelId}&contact=all&search=${encodeURIComponent(search)}&since=${since}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}"
+            hx-target="#conv-panel" hx-swap="innerHTML">${icon("close", "ico", 13)}</button>
+        </div>`
+      : html``}
+    <div id="conv-list-items">${renderConvItems(conversations)}</div>`;
+}
+
+/** Inbox channel <option>s, grouped into <optgroup>s by owning brand (brand-aware reply filter —
+ *  UNIFY1 Task 4: the SAME brand groups publish AND reply channels). Channels without a brand fall
+ *  into an "Unassigned" group. With no brands assigned at all, renders a flat option list. */
+function renderInboxChannelOptions(chans: InboxChannel[], channelId: string): Html {
+  const label = (ch: InboxChannel) => `${PLATFORM_LABELS[ch.platform] ?? ch.platform} · ${ch.display_name ?? ch.username ?? ch.id}`;
+  const opt = (ch: InboxChannel) => html`<option value="${ch.id}" ${channelId === ch.id ? "selected" : ""}>${label(ch)}</option>`;
+  const anyBrand = chans.some((ch) => ch.brand_key);
+  if (!anyBrand) return html`${chans.map(opt)}`;
+  const byBrand = new Map<string, InboxChannel[]>();
+  for (const ch of chans) {
+    const k = ch.brand_key ?? "";
+    (byBrand.get(k) ?? byBrand.set(k, []).get(k)!).push(ch);
+  }
+  const keys = [...byBrand.keys()].sort((a, b) => (a === "" ? 1 : b === "" ? -1 : a.localeCompare(b)));
+  return html`${keys.map(
+    (k) => html`<optgroup label="${k === "" ? "Unassigned" : k}">${byBrand.get(k)!.map(opt)}</optgroup>`,
+  )}`;
+}
+
+// The thread is a universal, chronological timeline of items from any inbound source. A reaction is a
+// small centered note; a comment is the post-anchored event that may have triggered an auto-DM/reply;
+// a message is a DM bubble. New channels add item kinds without changing the renderer's shape.
+type ThreadItem =
+  | { kind: "message"; id: string; direction: string; text: string | null; attachments?: StoredAttachments | null; quickReplyPayload?: string | null; postbackPayload?: string | null; createdAt: Date; deliveredAt?: Date | null; readAt?: Date | null }
+  | { kind: "reaction"; id: string; emoji: string | null; reactionType: string; createdAt: Date }
+  | { kind: "comment"; id: string; text: string; postId: string | null; postTitle: string | null; postUrl: string | null; replyText: string | null; dmSent: boolean; replySent: boolean; dmConvId: string | null; error: string | null; createdAt: Date };
+
+/** A pending `pending_approvals` row rendered as an in-thread draft bubble. `source` drives the tag
+ *  ("AI draft · awaiting approval" for ai_auto/ai_manual; "Held for approval" for a rule-hold). A draft
+ *  can carry a DM part and/or a public-comment part — both are shown, each with its own target tag. */
+export type DraftBubble = {
+  id: string;
+  source: "rule" | "ai_auto" | "ai_manual";
+  dmText: string | null;
+  commentText: string | null;
+};
+
+/** Fallback public URL for the post a comment was on, built from the id alone. Used only when no
+ *  permalink was stored on the row (comment_logs.post_url). Facebook post ids resolve directly;
+ *  Instagram media ids carry no shortcode, so IG relies on the stored permalink (resolved at log
+ *  time by the incoming-comment worker) and gets no fallback here. */
+function postUrlFor(platform: string, postId: string | null): string | null {
+  if (!postId) return null;
+  if (platform === "youtube") return `https://www.youtube.com/watch?v=${encodeURIComponent(postId)}`;
+  if (platform === "facebook") return `https://www.facebook.com/${encodeURIComponent(postId)}`;
+  return null;
+}
+
+/** Sender identity for an email thread's cards (the message items carry no per-row sender). */
+type ThreadContext = { name: string; handle: string };
+
+/** The mono meta line under a DM bubble: the message's own clock time, plus the outbound delivery
+ *  receipt inline ("· ✓✓ Seen 14:06" / "· ✓✓ Delivered" / "· ✓ Sent"). Read beats delivered. */
+function messageMeta(it: Extract<ThreadItem, { kind: "message" }>): Html {
+  const receipt =
+    it.direction === "outbound"
+      ? it.readAt
+        ? html` · ${icon("checks", "ico", 12)} Seen ${clockTime(it.readAt)}`
+        : it.deliveredAt
+          ? html` · ${icon("checks", "ico", 12)} Delivered`
+          : html` · ${icon("check", "ico", 12)} Sent`
+      : html``;
+  return html`<span class="msg-meta">${clockTime(it.createdAt)}${receipt}</span>`;
+}
+
+/** Friendly label for a stored media attachment by its platform `type`. Unknown types fall back to a
+ *  generic file label so a new attachment kind still renders something meaningful. */
+function mediaLabel(type: string): string {
+  if (type === "image") return "📷 Image";
+  if (type === "video") return "🎬 Video";
+  if (type === "audio") return "🎵 Audio";
+  return "📎 File";
+}
+
+/** Only http(s) media urls become clickable links; anything else (`javascript:`/`data:`, malformed,
+ *  or relative) renders as a plain label. The url is already attribute-escaped, so this is defence in
+ *  depth — future-proofing the inbox for when inbound media (with attacker-controlled urls) lands. */
+function isHttpUrl(url: string | null | undefined): boolean {
+  if (!url) return false;
+  try {
+    const proto = new URL(url).protocol;
+    return proto === "http:" || proto === "https:";
+  } catch {
+    return false;
+  }
+}
+
+/** Render a DM/comment message bubble's body. Beyond plain text it surfaces the stored non-text
+ *  content (follow-gate buttons, quick replies, media) that previously collapsed to an opaque
+ *  "(attachment)". EVERY interpolated value is auto-escaped by Hono `html`` (never `raw`): button /
+ *  quick-reply titles come from operator-authored rule config but are escaped anyway, and media urls
+ *  are attacker-influenceable so they're escaped and rendered as a label+link only (no `<img>` — by
+ *  owner decision; thumbnails are a later step). An inbound tap that carries only a payload (no text)
+ *  shows a subtle "tapped: <payload>". Falls back to "(no content)" only when there's truly nothing. */
+function renderMessageBody(it: Extract<ThreadItem, { kind: "message" }>): Html {
+  const att = it.attachments ?? null;
+  const chips: Html[] = [];
+  for (const m of att?.media ?? []) {
+    const label = mediaLabel(m.type);
+    chips.push(
+      isHttpUrl(m.url)
+        ? html`<a class="msg-chip msg-media" href="${m.url}" target="_blank" rel="noopener">${label}</a>`
+        : html`<span class="msg-chip msg-media">${label}</span>`,
+    );
+  }
+  for (const b of att?.buttons ?? []) chips.push(html`<span class="msg-chip">${b.title}</span>`);
+  for (const q of att?.quick_replies ?? []) chips.push(html`<span class="msg-chip">${q.title}</span>`);
+
+  const tap = !it.text && chips.length === 0 ? it.quickReplyPayload || it.postbackPayload || null : null;
+
+  if (!it.text && chips.length === 0 && !tap) return html`(no content)`;
+
+  return html`${it.text ? html`${it.text}` : html``}${chips.length
+    ? html`<div class="msg-extras">${chips}</div>`
+    : html``}${tap ? html`<div class="msg-tap">tapped: ${tap}</div>` : html``}`;
+}
+
+/** The thread timeline. `threadType` shapes the empty-state copy (a comment thread with no follow-up
+ *  DM is a normal state, not an error) and the layout: email threads render as stacked email cards,
+ *  DM/comment threads as a chat timeline. `ctx` supplies the sender identity for email cards. */
+export function renderMessages(items: ThreadItem[], threadType: ConversationThreadType = "dm", ctx?: ThreadContext): Html {
+  if (items.length === 0) {
+    return html`<p class="muted">${threadType === "comment"
+      ? "This comment thread has no messages yet — reply below to start a DM."
+      : threadType === "email"
+        ? "No emails yet — replies will appear here."
+        : "No messages yet — say hello below."}</p>`;
+  }
+
+  // Email: each message is a full card (from avatar + name/address + date, then the body). We have no
+  // stored quoted-history or signature on the row, so those prototype parts are omitted, not faked.
+  if (threadType === "email") {
+    return html`${items.map((it) => {
+      if (it.kind !== "message") return html``;
+      const outbound = it.direction === "outbound";
+      const fromName = outbound ? "You" : ctx?.name ?? "Contact";
+      const fromAddr = outbound ? "" : ctx?.handle ?? "";
+      return html`<article class="email">
+        <header class="email-head">
+          <span class="email-from-av">${initialsOf(fromName)}</span>
+          <span class="email-meta"><div class="email-from">${fromName}${fromAddr ? html` <span class="email-addr">&lt;${fromAddr}&gt;</span>` : html``}</div></span>
+          <span class="email-date">${emailWhen(it.createdAt)}</span>
+        </header>
+        <div class="email-body">${it.text ?? "(no content)"}</div>
+      </article>`;
+    })}`;
+  }
+
+  // DM / comment timeline. A reaction is a separate thread item; fold it onto the message it follows
+  // as a small emoji pill tucked under that bubble — never a standalone centered "reacted" line.
+  const rows: { item: ThreadItem; reactions: string[] }[] = [];
+  for (const it of items) {
+    if (it.kind === "reaction") {
+      const emoji = it.emoji ?? it.reactionType;
+      if (rows.length) rows[rows.length - 1].reactions.push(emoji);
+      else rows.push({ item: it, reactions: [emoji] }); // a lone reaction with nothing before it
+    } else {
+      rows.push({ item: it, reactions: [] });
+    }
+  }
+  return html`<div class="daysep">Today</div>${rows.map(({ item: it, reactions }) => {
+    const reactPills = html`${reactions.map((e) => html`<span class="msg-react">${e}</span>`)}`;
+    if (it.kind === "reaction") {
+      // Orphan reaction (no preceding message) — show the pill on its own, aligned inbound-side.
+      return html`<div class="msg msg-in">${reactPills}</div>`;
+    }
+    if (it.kind === "comment") {
+      // The post the comment was on — prefer a clickable link to the permalink. Label with the
+      // published post's content title when we can resolve it (platform_post_id → posts → content),
+      // falling back to the raw platform post id.
+      const postLabel = it.postTitle ?? it.postId;
+      const link = it.postId
+        ? it.postUrl
+          ? html`<a class="cmt-link" href="${it.postUrl}" target="_blank" rel="noopener">${postLabel} ↗</a>`
+          : html`<span class="cmt-link">${postLabel}</span>`
+        : html``;
+      return html`<div class="msg msg-in msg-comment">
+        <div class="bubble">
+          <div class="cmt-top">${icon("comment", "ico", 12)} commented on post${link}</div>
+          <div>${it.text}</div>
+          ${it.replySent
+            ? html`<div class="cmt-dm">${icon("check", "ico", 12)} public reply sent${it.replyText ? html` — “${it.replyText}”` : html``}</div>`
+            : html``}
+          ${it.dmSent
+            ? html`<div class="cmt-dm">${icon("check", "ico", 12)} auto-DM sent${it.dmConvId ? html` · <a href="#" hx-get="/inbox/${it.dmConvId}" hx-target="#thread" hx-swap="innerHTML">open DM thread →</a>` : html``}</div>`
+            : html``}
+          ${it.error ? html`<div class="cmt-err">${icon("alert", "ico", 11)} ${it.error}</div>` : html``}
+        </div>
+        ${reactPills}
+        <span class="msg-meta">${clockTime(it.createdAt)}</span>
+      </div>`;
+    }
+    return html`<div class="msg ${it.direction === "outbound" ? "msg-out" : "msg-in"}">
+      <div class="bubble">${renderMessageBody(it)}</div>
+      ${reactPills}
+      ${messageMeta(it)}
+    </div>`;
+  })}`;
+}
+
+type ConvControls = { id: string; platform: string; status: string; thread_type: ConversationThreadType; thread_ref: string; is_automation_paused: boolean; needs_manual_reply: boolean; assigned_to: string | null; last_inbound_at: Date | null; subject: string | null; channel: { display_name: string | null; platform: string } };
+
+const STATUS_LABEL: Record<string, string> = { open: "Open", closed: "Closed", snoozed: "Snoozed" };
+const STATUS_TIP: Record<string, string> = {
+  open: "Active — sitting in your inbox.",
+  closed: "Marked done — leaves the inbox until this person messages again.",
+  snoozed: "Set aside — comes back to the inbox on their next message.",
+};
+
+/** The Done / Reopen actions for the thread header's top row (`.th-actions`, pushed right), wired to
+ *  the status mutation on PATCH /conversations/:id. Marking Done leaves it out of the active inbox
+ *  until the person writes again (the incoming workers auto-reopen). The `snoozed` status still
+ *  exists in the schema for a future timed-snooze, but isn't exposed as a button today. */
+function renderThreadActions(conv: ConvControls): Html {
+  const statusBtn = (label: Html, status: string, title: string) =>
+    html`<button class="btn btn-sm" title="${title}" hx-post="/inbox/${conv.id}/conversation" hx-ext="json-enc" hx-vals='${`{"status":"${status}"}`}' hx-target="#thread" hx-swap="innerHTML">${label}</button>`;
+  return html`<span class="th-actions">${conv.status === "open"
+    ? statusBtn(html`${icon("check", "ico", 14)} Done`, "closed", "Mark done — leaves the inbox until this person messages again.")
+    : statusBtn(html`${icon("reopen", "ico", 14)} Reopen`, "open", "Put it back in the active inbox.")}</span>`;
+}
+
+/** The status/automation controls row under the thread title (`.th-controls`): a status pill with a
+ *  tone dot, a "Needs reply" badge, and the auto-replies toggle SWITCH (checked = bot on). The switch
+ *  fires the SAME pause/resume mutation the old button did — flipping the current state on change —
+ *  plus a collapsible legend so the controls stay self-explanatory. Wired to PATCH /conversations/:id. */
+function renderConvControls(conv: ConvControls): Html {
+  const statusTone: Tone = conv.status === "open" ? "info" : conv.status === "closed" ? "ok" : "neutral";
+  const paused = conv.is_automation_paused;
+  return html`<div class="th-controls">
+    <span class="badge tone-${statusTone}" title="${STATUS_TIP[conv.status] ?? ""}">${dot(statusTone)}${STATUS_LABEL[conv.status] ?? conv.status}</span>
+    ${conv.needs_manual_reply ? html`<span class="badge tone-bad" title="Automation didn't handle this — a human should reply.">${icon("alert", "ico", 11)} Needs reply</span>` : html``}
+    ${conv.assigned_to ? html`<span class="muted" title="Assigned to a teammate.">assigned</span>` : html``}
+    <label class="pause-row ${paused ? "is-paused" : ""}" title="${paused ? "Auto-replies are paused for this person — flip the switch on to let the bot reply again." : "The bot auto-replies to this person — flip the switch off to answer manually."}">
+      <input type="checkbox" class="switch" ${paused ? "" : "checked"}
+        hx-post="/inbox/${conv.id}/conversation" hx-ext="json-enc"
+        hx-vals='${`{"is_automation_paused":${paused ? "false" : "true"}}`}'
+        hx-target="#thread" hx-swap="innerHTML" />
+      <span>${paused ? "Auto-replies paused" : "Auto-replies on"}</span>
+    </label>
+    <details class="thread-legend"><summary class="muted">${icon("info", "ico", 13)} what do these mean?</summary>
+      <div class="muted" style="margin-top:.3rem;line-height:1.5">
+        <strong>Done</strong> — handled; leaves the inbox until they write again (find it under the <em>Done</em> filter).<br/>
+        <strong>Auto-replies</strong> — toggle the bot on/off for this person; off means you reply by hand.<br/>
+        <strong>Needs reply</strong> — automation found no rule for this; waiting on a human.
+      </div>
+    </details>
+  </div>`;
+}
+
+/** Pending approvals for this conversation, as draft bubbles (workspace-scoped, oldest first so a
+ *  draft sits after the message it answers). Pulls the DM text and/or the public-comment text out of
+ *  the parked `proposed_content`. */
+async function loadDrafts(conversationId: string, workspaceId: string): Promise<DraftBubble[]> {
+  const rows = await db
+    .select({ id: pendingApprovals.id, source: pendingApprovals.source, proposed: pendingApprovals.proposed_content, created_at: pendingApprovals.created_at })
+    .from(pendingApprovals)
+    .where(and(
+      eq(pendingApprovals.conversation_id, conversationId),
+      eq(pendingApprovals.workspace_id, workspaceId),
+      eq(pendingApprovals.status, "pending"),
+    ))
+    .orderBy(asc(pendingApprovals.created_at));
+  return rows.map((r) => {
+    const pc = (r.proposed ?? {}) as { content?: { text?: string } | null; comment?: { text?: string } | null };
+    return { id: r.id, source: r.source, dmText: pc.content?.text ?? null, commentText: pc.comment?.text ?? null };
+  });
+}
+
+/**
+ * ADUX1: a pending approval rendered as a draft card — the proposed text (DM and/or public), a source
+ * tag, and Accept / Edit / Reject. A rule-hold and an AI draft render identically (only the tag copy
+ * differs). All dynamic text is escaped by `html``.
+ *
+ * Edit is a client-side toggle (Alpine `editing`), not an always-visible textarea: the read-only view
+ * (Accept/Edit/Reject) and the edit form (textarea + Save/Cancel) are mutually exclusive `x-show`
+ * blocks sharing one `editing` flag. Cancel resets the textarea to its original `defaultValue` before
+ * hiding it — Alpine's `x-show` only toggles visibility, so an abandoned edit would otherwise still be
+ * sitting in the DOM the next time Edit is clicked. Save still posts to the existing
+ * `/inbox/approval/:id/edit` route (unchanged) and re-renders the thread.
+ */
+function renderDraftBubble(d: DraftBubble): Html {
+  const isAi = d.source !== "rule";
+  const tag = isAi ? "AI draft · awaiting approval" : "Held for approval";
+  // Both parts share one edited text on save (the Edit route updates whichever exist), so the textarea
+  // prefills with the DM body when present, else the public-comment text.
+  const prefill = d.dmText ?? d.commentText ?? "";
+  return html`<div class="msg msg-draft" data-approval-id="${d.id}" x-data="{ editing: false }">
+    <div class="bubble draft-bubble">
+      <div class="draft-tag">${icon(isAi ? "sparkles" : "clock", "ico", 12)} ${tag}</div>
+      <div x-show="!editing">
+        ${d.commentText
+          ? html`<div class="draft-part"><span class="badge tone-info">public comment reply</span><div class="draft-text">${d.commentText}</div></div>`
+          : html``}
+        ${d.dmText
+          ? html`<div class="draft-part"><span class="badge tone-neutral">DM</span><div class="draft-text">${d.dmText}</div></div>`
+          : html``}
+        <div class="draft-actions">
+          <button class="btn btn-sm btn-primary" type="button" hx-post="/inbox/approval/${d.id}/approve" hx-target="#thread" hx-swap="innerHTML">Accept</button>
+          <button class="btn btn-sm" type="button" @click="editing = true">Edit</button>
+          <button class="btn btn-sm btn-danger" type="button" hx-post="/inbox/approval/${d.id}/reject" hx-target="#thread" hx-swap="innerHTML">Reject</button>
+          <button class="btn btn-sm btn-danger" type="button" hx-delete="/inbox/approval/${d.id}" hx-target="#thread" hx-swap="innerHTML" hx-confirm="Delete this draft? It will be gone from the inbox and from Approvals." data-confirm-label="Delete">Delete</button>
+        </div>
+      </div>
+      <form class="draft-edit" x-show="editing" x-cloak hx-post="/inbox/approval/${d.id}/edit" hx-ext="json-enc" hx-target="#thread" hx-swap="innerHTML">
+        <textarea class="textarea" name="text" rows="3" required x-ref="ta">${prefill}</textarea>
+        <div class="draft-actions">
+          <button class="btn btn-sm btn-primary" type="submit">Save</button>
+          <button class="btn btn-sm" type="button" @click="editing = false; $refs.ta.value = $refs.ta.defaultValue">Cancel</button>
+        </div>
+      </form>
+    </div>
+  </div>`;
+}
+
+// A generated draft is written by an async worker (graphile-worker job), not inside the enqueue
+// request — so right after clicking "Generate reply" the thread has no NEW draft yet. Self-
+// terminating poll: while the draft count hasn't grown past what it was BEFORE this click
+// (`expectMoreThan` — not "are there any drafts at all", which broke the moment a SECOND draft was
+// requested while an unapproved first one was still sitting there), re-fetch this region after a
+// short delay; once it has, render with NO further hx-get/hx-trigger, so htmx (bound to the
+// swapped-out element) stops polling on its own. Bounded to MAX_DRAFT_POLL_ATTEMPTS so an idle tab
+// on a thread whose generation failed silently doesn't poll forever. Deliberately a SEPARATE
+// region/poll from `#thread-msgs`'s own 5s poll: swapping the whole drafts region on a timer would
+// blow away an in-progress Edit (ADUX1's `x-data="{editing:true}"` lives inside the draft bubble) —
+// this poll can't fire again once the awaited draft exists, so it never collides with an open edit.
+const MAX_DRAFT_POLL_ATTEMPTS = 20; // ~60s at 3s intervals — comfortably past normal LLM latency
+// `poll` only starts a chain right after the "Generate reply" click (the response that ENQUEUED the
+// job) — a plain thread load/refresh never starts one, so opening an ordinary comment/DM thread with
+// AI drafting enabled but no generation ever requested costs nothing extra.
+function renderDraftsRegion(
+  drafts: DraftBubble[],
+  conversationId: string,
+  poll: { attempt: number; expectMoreThan: number } | false = false,
+): Html {
+  const waiting = poll !== false && drafts.length <= poll.expectMoreThan && poll.attempt < MAX_DRAFT_POLL_ATTEMPTS;
+  // Existing drafts (already-generated, still-pending ones from an earlier click) always render —
+  // waiting on a NEW one must never hide them.
+  const existing = drafts.map(renderDraftBubble);
+  if (!waiting) {
+    return html`<div id="thread-drafts" class="thread-drafts">${existing}</div>`;
+  }
+  // Visible feedback for the whole waiting window — the button's own click-spinner (.htmx-request,
+  // admin.css) only lasts for the ~100ms enqueue request itself, not the several seconds the LLM
+  // call actually takes. Reuses the same ps-spin keyframe for a consistent look.
+  const spinner = html`<div class="draft-generating"><span class="draft-spinner" aria-hidden="true"></span>AI is generating a reply…</div>`;
+  return html`<div id="thread-drafts" class="thread-drafts" hx-get="/inbox/${conversationId}/drafts?attempt=${poll.attempt + 1}&since=${poll.expectMoreThan}" hx-trigger="load delay:3s" hx-swap="outerHTML">${existing}${spinner}</div>`;
+}
+
+export function renderThread(
+  conv: ConvName & ConvControls,
+  messages: ThreadItem[],
+  // On a failed send, show the error and keep the operator's typed text instead of clearing it
+  // out as if the message went. `canReply` = the manual_reply PRO feature: free can READ the inbox
+  // but the human-reply box is locked (rules still auto-reply for free). `upgradeUrl` for the lock.
+  // `pollDrafts`: how many drafts already existed right BEFORE this click's job was enqueued — the
+  // poll waits for the count to grow past this, not just "is there any draft" (see renderDraftsRegion).
+  opts: { error?: string; draft?: string; canReply?: boolean; canAiDraft?: boolean; aiConfigured?: boolean; upgradeUrl?: string; drafts?: DraftBubble[]; pollDrafts?: number } = {},
+): Html {
+  const canReply = opts.canReply ?? true;
+  const drafts = opts.drafts ?? [];
+  const canAiDraft = opts.canAiDraft ?? false;
+  // Whether an AI provider key is set. Defaults to true so callers that don't pass it keep the old
+  // behaviour; the inbox handlers pass the real value so the buttons disable when AI can't run.
+  const aiConfigured = opts.aiConfigured ?? true;
+  // Meta 24h-window heads-up: warn when the standard window is closing/closed (the send still goes —
+  // a human reply past 24h rides the HUMAN_AGENT tag, see ./messaging-window + the outgoing worker).
+  const windowState = messagingWindowState({ platform: conv.platform, threadType: conv.thread_type, lastInboundAt: conv.last_inbound_at });
+  const windowNote = canReply && windowState.label
+    ? html`<div class="notice ${windowState.kind === "closing_soon" ? "" : "notice-warn"}" style="font-size:.78rem;display:flex;align-items:center;gap:6px">${icon("clock", "ico", 13)}<span>${windowState.label}</span></div>`
+    : html``;
+  const isEmail = conv.platform === "gmail";
+  const name = contactName(conv);
+  const title = isEmail ? conv.subject || "(no subject)" : name;
+  const ctx: ThreadContext = { name, handle: contactHandle(conv) };
+  // On-demand "Generate reply" (PRO): drafts an AI reply that's parked for approval. The public
+  // option only makes sense on a comment thread (the worker addresses the comment). The button
+  // POSTs to /inbox/:id/ai-draft (json-enc) and re-renders the thread with a toast.
+  const isComment = conv.thread_type === "comment";
+  // Without a provider key the buttons are disabled (a click would only ever park an empty
+  // generation) and a notice points to Settings — the same signal the API's `ai_configured` carries.
+  const aiOffNote = "AI provider not configured — set an API key in Settings.";
+  const aiDraftBar = canAiDraft
+    ? html`<div class="ai-draft-bar" style="display:flex;flex-direction:column;gap:.35rem;padding:.3rem 0">
+        ${aiConfigured ? html`` : aiUnconfiguredBanner("AI drafts")}
+        <div style="display:flex;gap:.4rem">
+          <button class="btn btn-sm" type="button" ${aiConfigured ? "" : "disabled"}
+            title="${aiConfigured ? "Draft a DM reply with AI — it'll be parked here for your approval." : aiOffNote}"
+            hx-post="/inbox/${conv.id}/ai-draft" hx-ext="json-enc" hx-vals='${`{"target":"dm"}`}'
+            hx-target="#thread" hx-swap="innerHTML">${icon("sparkles", "ico", 13)} Generate reply</button>
+          ${isComment
+            ? html`<button class="btn btn-sm" type="button" ${aiConfigured ? "" : "disabled"}
+                title="${aiConfigured ? "Draft a public reply to the comment with AI — parked for your approval." : aiOffNote}"
+                hx-post="/inbox/${conv.id}/ai-draft" hx-ext="json-enc" hx-vals='${`{"target":"public"}`}'
+                hx-target="#thread" hx-swap="innerHTML">${icon("comment", "ico", 13)} Generate public reply</button>`
+            : html``}
+        </div>
+      </div>`
+    : html``;
+  return html`<div class="thread-head">
+      <div class="th-top">
+        <span class="th-av">${initialsOf(name)}</span>
+        <span class="th-id"><div class="th-nm">${title}</div><div class="th-via">${platformVia(conv)}</div></span>
+        ${renderThreadActions(conv)}
+      </div>
+      ${renderConvControls(conv)}
+    </div>
+    ${opts.error ? html`<div class="notice notice-err">${opts.error}</div>` : html``}
+    <div id="thread-msgs" class="thread-msgs${isEmail ? " email-list" : ""}" hx-get="/inbox/${conv.id}/messages" hx-trigger="every 5s" hx-swap="innerHTML">${renderMessages(messages, conv.thread_type, ctx)}</div>
+    ${renderDraftsRegion(drafts, conv.id, opts.pollDrafts !== undefined ? { attempt: 0, expectMoreThan: opts.pollDrafts } : false)}
+    ${windowNote}
+    ${aiDraftBar}
+    ${canReply
+      ? html`<form class="reply-bar" hx-post="/inbox/${conv.id}/reply" hx-ext="json-enc" hx-target="#thread" hx-swap="innerHTML">
+          <textarea class="textarea" name="text" rows="2" placeholder="Type a reply..." required>${opts.draft ?? ""}</textarea>
+          <button class="btn btn-primary" type="submit">Send</button>
+        </form>`
+      : html`<div class="reply-bar reply-locked">
+          <textarea class="textarea" rows="2" placeholder="Replying by hand is a PRO feature — your rules still auto-reply for free." disabled></textarea>
+          <a class="btn btn-primary" href="${opts.upgradeUrl ?? "#"}">Upgrade to reply</a>
+        </div>`}`;
+}
+
+// Inbox "active since" presets → rolling window in ms (last_message_at cutoff). "" = any time.
+const CONV_SINCE_PRESETS: Record<string, number> = {
+  "24h": 24 * 3_600_000,
+  "7d": 7 * 86_400_000,
+  "30d": 30 * 86_400_000,
+  "90d": 90 * 86_400_000,
+};
+export function parseConvSince(v: string | undefined): string {
+  if (v === "custom") return "custom";
+  return v && v in CONV_SINCE_PRESETS ? v : "";
+}
+
+/** Parse a YYYY-MM-DD form value to a UTC midnight Date (TZ=UTC is pinned), or null if malformed. */
+function parseYmd(v: string | undefined): Date | null {
+  if (!v || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return null;
+  const d = new Date(`${v}T00:00:00.000Z`);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function loadConversations(
+  workspaceId: string,
+  filter: ConvFilter = "open",
+  channelId = "all",
+  contactId = "all",
+  search = "",
+  since = "",
+  from = "",
+  to = "",
+) {
+  const where: SQL[] = [eq(conversations.workspace_id, workspaceId)];
+  // Triage: "Done" is the archive (anything not open — closed or snoozed); every other view is the
+  // active queue (status='open'), optionally narrowed by a type/state facet. A new inbound message
+  // auto-flips a thread back to 'open' (incoming workers), so a Done/snoozed thread reappears on its
+  // own when the person writes again — that's what makes hiding them from the active queue safe.
+  if (filter === "done") {
+    where.push(ne(conversations.status, "open"));
+  } else {
+    where.push(eq(conversations.status, "open"));
+    if (filter === "needs_reply") where.push(eq(conversations.needs_manual_reply, true));
+    else if (filter === "unread") where.push(gt(conversations.unread_count, 0));
+    else if (filter === "dm") where.push(eq(conversations.thread_type, "dm"));
+    else if (filter === "comment") where.push(eq(conversations.thread_type, "comment"));
+  }
+  if (channelId !== "all") where.push(eq(conversations.channel_id, channelId));
+  if (contactId !== "all") where.push(eq(conversations.contact_id, contactId));
+  // Date filter: a rolling preset window, or a custom from–to range (inclusive of the "to" day).
+  if (since === "custom") {
+    const fromD = parseYmd(from);
+    const toD = parseYmd(to);
+    if (fromD) where.push(gte(conversations.last_message_at, fromD));
+    if (toD) where.push(lt(conversations.last_message_at, new Date(toD.getTime() + 86_400_000)));
+  } else {
+    const windowMs = CONV_SINCE_PRESETS[since];
+    if (windowMs) where.push(gt(conversations.last_message_at, new Date(Date.now() - windowMs)));
+  }
+  // Contact-name search: match conversations whose contact's display name contains the query.
+  const q = search.trim();
+  if (q) {
+    where.push(
+      inArray(
+        conversations.contact_id,
+        db.select({ id: contacts.id }).from(contacts).where(
+          and(eq(contacts.workspace_id, workspaceId), ilike(contacts.display_name, `%${q}%`)),
+        ),
+      ),
+    );
+  }
+  return db.query.conversations.findMany({
+    where: and(...where),
+    orderBy: desc(conversations.last_message_at),
+    limit: 50,
+    ...CONV_QUERY,
+  });
+}
+
+/** Count of "Done" (archived: closed or snoozed) conversations, for the Done filter pill badge.
+ *  Scoped like the list (workspace + channel + contact) but ignoring the type/state facets so the
+ *  badge reflects "everything you've cleared", not the currently-selected view. */
+async function loadDoneCount(workspaceId: string, channelId = "all", contactId = "all"): Promise<number> {
+  const where: SQL[] = [eq(conversations.workspace_id, workspaceId), ne(conversations.status, "open")];
+  if (channelId !== "all") where.push(eq(conversations.channel_id, channelId));
+  if (contactId !== "all") where.push(eq(conversations.contact_id, contactId));
+  const [row] = await db.select({ n: count() }).from(conversations).where(and(...where));
+  return Number(row?.n ?? 0);
+}
+
+/** Channels for the inbox channel-filter dropdown (id + label + brand for grouping). */
+function loadInboxChannels(workspaceId: string) {
+  return db.query.channels.findMany({
+    where: eq(channels.workspace_id, workspaceId),
+    orderBy: asc(channels.created_at),
+    columns: { id: true, display_name: true, platform: true, username: true, brand_key: true },
+  });
+}
+
+function loadConversation(id: string, workspaceId: string) {
+  return db.query.conversations.findFirst({
+    where: and(eq(conversations.id, id), eq(conversations.workspace_id, workspaceId)),
+    ...CONV_QUERY,
+  });
+}
+
+async function loadMessages(conversationId: string): Promise<ThreadItem[]> {
+  // The thread's own conversation: gives the platform (for post links) and, for a comment thread,
+  // lets us link each comment's auto-DM to the contact's separate DM thread.
+  const conv = await db.query.conversations.findFirst({
+    where: eq(conversations.id, conversationId),
+    columns: { workspace_id: true, channel_id: true, contact_id: true, thread_type: true, platform: true },
+  });
+  let dmSiblingId: string | null = null;
+  if (conv && conv.thread_type === "comment") {
+    const dm = await db.query.conversations.findFirst({
+      where: and(eq(conversations.channel_id, conv.channel_id), eq(conversations.contact_id, conv.contact_id), eq(conversations.thread_type, "dm")),
+      columns: { id: true },
+    });
+    dmSiblingId = dm?.id ?? null;
+  }
+  const platform = conv?.platform ?? "";
+
+  const [msgs, reactions, comments] = await Promise.all([
+    db.query.messages.findMany({
+      where: eq(messages.conversation_id, conversationId),
+      orderBy: desc(messages.created_at),
+      limit: 50,
+      columns: { id: true, direction: true, text: true, attachments: true, quick_reply_payload: true, postback_payload: true, created_at: true, delivered_at: true, read_at: true },
+    }),
+    db.query.messageReactions.findMany({
+      where: eq(messageReactions.conversation_id, conversationId),
+      orderBy: desc(messageReactions.created_at),
+      limit: 50,
+      columns: { id: true, emoji: true, reaction_type: true, created_at: true },
+    }),
+    // Comments that opened/belong to this thread — the event the operator is actually replying to.
+    db.query.commentLogs.findMany({
+      where: eq(commentLogs.conversation_id, conversationId),
+      orderBy: desc(commentLogs.created_at),
+      limit: 50,
+      columns: { id: true, comment_text: true, post_id: true, post_url: true, reply_text: true, dm_sent: true, reply_sent: true, error: true, created_at: true },
+    }),
+  ]);
+  // Resolve each comment's platform post id back to its published content title, in ONE workspace-scoped
+  // batch (platform_post_id → posts → content). Keyed by platform_post_id; a comment whose post id has
+  // no matching published post (or no content) keeps its raw id label.
+  const postTitleById = new Map<string, string>();
+  const commentPostIds = [...new Set(comments.map((c) => c.post_id).filter((id): id is string => !!id))];
+  if (conv && commentPostIds.length > 0) {
+    const titleRows = await db
+      .select({ platformPostId: posts.platform_post_id, title: content.title })
+      .from(posts)
+      .innerJoin(content, eq(posts.content_id, content.id))
+      .where(and(eq(posts.workspace_id, conv.workspace_id), inArray(posts.platform_post_id, commentPostIds)));
+    for (const r of titleRows) {
+      if (r.platformPostId && !postTitleById.has(r.platformPostId)) postTitleById.set(r.platformPostId, r.title);
+    }
+  }
+  const items: ThreadItem[] = [
+    ...msgs.map((m) => ({ kind: "message" as const, id: m.id, direction: m.direction, text: m.text, attachments: (m.attachments as StoredAttachments | null) ?? null, quickReplyPayload: m.quick_reply_payload, postbackPayload: m.postback_payload, createdAt: m.created_at, deliveredAt: m.delivered_at, readAt: m.read_at })),
+    ...reactions.map((r) => ({ kind: "reaction" as const, id: r.id, emoji: r.emoji, reactionType: r.reaction_type, createdAt: r.created_at })),
+    ...comments.map((c) => ({ kind: "comment" as const, id: c.id, text: c.comment_text, postId: c.post_id, postTitle: c.post_id ? postTitleById.get(c.post_id) ?? null : null, postUrl: c.post_url ?? postUrlFor(platform, c.post_id), replyText: c.reply_text, dmSent: c.dm_sent, replySent: c.reply_sent, dmConvId: dmSiblingId, error: c.error, createdAt: c.created_at })),
+  ];
+  // Chronological ascending; interleaves comments, reactions and messages by time.
+  return items.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+}
+
+// ─── channels ─────────────────────────────────────────────────────────────────
+
+const PLATFORM_LABELS: Record<string, string> = { facebook: "Facebook", instagram: "Instagram", telegram: "Telegram", youtube: "YouTube" };
+
+/** Friendly label + tone for each activity-feed event type (raw type is the fallback). */
+const EVENT_META: Record<string, { label: string; tone: Tone }> = {
+  "channel.created": { label: "Channel connected", tone: "ok" },
+  "channel.reconnected": { label: "Channel reconnected", tone: "ok" },
+  "channel.needs_reauth": { label: "Channel needs re-auth", tone: "bad" },
+  "post.published": { label: "Post published", tone: "ok" },
+  "post.held": { label: "Post held", tone: "warn" },
+  "post.failed": { label: "Post failed", tone: "bad" },
+  "post.unknown": { label: "Post error", tone: "bad" },
+  "source.connected": { label: "Source connected", tone: "ok" },
+  "source.synced": { label: "Source synced", tone: "info" },
+  "source.needs_reauth": { label: "Source needs re-auth", tone: "bad" },
+  "source.data_access_expiring": { label: "Data access expiring", tone: "warn" },
+};
+
+// Plain-language meaning of each inbound webhook handling status, for the /webhooks legend.
+const WEBHOOK_STATUS_LEGEND: ReadonlyArray<readonly [string, Tone, string]> = [
+  ["fired", "ok", "Matched an active rule — an auto-reply was sent or queued."],
+  ["recorded", "info", "Stored for engagement only (a like/reaction on your post) — no rule runs on these."],
+  ["received", "neutral", "Arrived and logged, still being processed (transient)."],
+  ["no_match", "neutral", "Valid event, but no rule's keywords/trigger matched."],
+  ["paused", "warn", "A rule would match, but it's currently paused."],
+  ["ignored", "neutral", "Intentionally skipped — e.g. your own echo or a duplicate."],
+  ["unhandled", "neutral", "An event type the app doesn't act on."],
+  ["error", "bad", "Processing failed — open the event for details."],
+  // OBS1: endpoint-level outcomes that never became an event (no channel) — see "Endpoint activity".
+  ["handshake_ok", "ok", "Meta verified your webhook subscription (the GET challenge succeeded)."],
+  ["handshake_fail", "bad", "A subscription verification was refused — wrong/absent verify token or unexpected mode."],
+  ["rejected_signature", "bad", "A POST was refused before processing — its signature didn't match your app secret."],
+  ["rejected_parse", "bad", "A POST body wasn't valid JSON — refused before processing."],
+  ["rejected_object", "warn", "A POST for an object type the app doesn't handle — recorded, not processed."],
+  ["rejected_too_large", "bad", "A POST body exceeded the size cap — refused before buffering."],
+];
+// OBS1: the endpoint-activity statuses (handshake + rejected-before-record). These rows have no
+// channel, so they live in their own instance-wide list rather than the per-channel incoming log.
+const WEBHOOK_ENDPOINT_STATUSES = [
+  "handshake_ok", "handshake_fail", "rejected_signature", "rejected_parse", "rejected_object", "rejected_too_large",
+] as const;
+const WEBHOOK_STATUS_TONE: Record<string, Tone> = Object.fromEntries(WEBHOOK_STATUS_LEGEND.map(([s, tone]) => [s, tone]));
+
+type WebhookEventDetail = typeof import("@/db/schema").webhookEvents.$inferSelect;
+
+function metaRow(label: string, value: unknown): Html {
+  if (value === null || value === undefined || value === "") return html``;
+  return html`<div class="meta-row"><dt>${label}</dt><dd>${typeof value === "boolean" ? (value ? "yes" : "no") : String(value)}</dd></div>`;
+}
+
+/** Find the display name a platform attached to an id anywhere in the raw payload (Meta nests it as
+ *  `{ id, name }` under from/sender/recipient). Generic recursive match so it works for any event. */
+function findNameForId(node: unknown, id: string, depth = 0): string | null {
+  if (depth > 8 || node === null || typeof node !== "object") return null;
+  const o = node as Record<string, unknown>;
+  if (o.id === id && typeof o.name === "string" && o.name.trim()) return o.name;
+  for (const v of Object.values(o)) {
+    const found = findNameForId(v, id, depth + 1);
+    if (found) return found;
+  }
+  return null;
+}
+
+/** A "From"/"To" row that leads with the person's name and shows the raw id quietly beside it. */
+function identityRow(label: string, id: string | null, raw: unknown): Html {
+  if (!id) return html``;
+  const name = findNameForId(raw, id);
+  return html`<div class="meta-row"><dt>${label}</dt><dd>${name
+    ? html`<strong>${name}</strong> <code class="mono" style="color:var(--text-2);font-size:.74rem">${id}</code>`
+    : html`<code class="mono">${id}</code>`}</dd></div>`;
+}
+
+/** Expanded view of one inbound webhook event: what arrived + what (if anything) it triggered + the
+ *  full raw payload. Lazy-loaded into #wh-detail so the list stays light. */
+function renderWebhookDetail(e: WebhookEventDetail): Html {
+  const triggered: Array<[string, string]> = [];
+  if (e.conversation_id) triggered.push(["Conversation", e.conversation_id]);
+  if (e.message_id) triggered.push(["Message", e.message_id]);
+  if (e.comment_log_id) triggered.push(["Comment action", e.comment_log_id]);
+  if (e.outbound_delivery_id) triggered.push(["Outbound reply", e.outbound_delivery_id]);
+  if (e.contact_id) triggered.push(["Contact", e.contact_id]);
+  const rawJson = JSON.stringify(e.raw, null, 2);
+  const tone = WEBHOOK_STATUS_TONE[e.handling_status] ?? "neutral";
+  return html`<section class="panel${e.handling_status === "error" ? " panel-error" : ""}" id="wh-detail-card" style="margin:.5rem 0 1rem">
+    <div class="panel-head">
+      <h3>${PLATFORM_LABELS[e.object ?? ""] ?? e.object ?? "—"} · ${e.event_type}${e.field ? ` · ${e.field}` : ""}</h3>
+      <span class="badge tone-${tone}">${e.handling_status}</span>
+      <button class="btn btn-ghost btn-sm" style="margin-left:auto" hx-get="/webhooks/clear" hx-target="#wh-detail" hx-swap="innerHTML">${icon("close", "ico", 14)} Close</button>
+    </div>
+    <div class="panel-head" style="border-top:1px solid var(--border)"><h3>What came in</h3></div>
+    <dl class="meta-list">
+      ${metaRow("Received", e.received_at.toISOString().replace("T", " ").slice(0, 19))}
+      ${metaRow("Handled", e.handled_at ? e.handled_at.toISOString().replace("T", " ").slice(0, 19) : null)}
+      ${identityRow("From", e.sender_id, e.raw)}
+      ${identityRow("To", e.recipient_id, e.raw)}
+      ${metaRow("Platform message id", e.platform_message_id)}
+      ${metaRow("Echo (our own message)", e.is_echo)}
+      ${metaRow("Event key", e.event_key)}
+    </dl>
+    <div class="panel-head" style="border-top:1px solid var(--border)"><h3>What was triggered</h3></div>
+    ${triggered.length === 0
+      ? html`<p style="margin:0;padding:11px 16px;font-size:12.5px;color:var(--text-3)">${e.handling_status === "recorded" ? "Nothing — stored for engagement only (no rule runs on post likes/reactions)." : e.handling_status === "fired" ? "A reply was sent/queued (no linked record captured)." : "Nothing was triggered for this event."}</p>`
+      : html`<dl class="meta-list">${triggered.map(([k, v]) =>
+          k === "Conversation"
+            ? html`<div class="meta-row"><dt>${k}</dt><dd><a href="/inbox/${v}">${v} →</a></dd></div>`
+            : html`<div class="meta-row"><dt>${k}</dt><dd><code>${v}</code></dd></div>`,
+        )}</dl>`}
+    ${e.error_detail ? html`<div class="notice notice-err" style="margin:11px 16px">${e.error_detail}</div>` : html``}
+    <div class="panel-head" style="border-top:1px solid var(--border)"><h3>Raw payload</h3></div>
+    <pre class="payload" style="border-top:0;max-height:340px;overflow:auto;white-space:pre-wrap;word-break:break-word">${rawJson}</pre>
+  </section>`;
+}
+
+interface WebhookStats { total: number; last24h: number; byStatus: Record<string, number> }
+
+// STATSCACHE1: short-lived memo over the hot raw tables. Keyed by the channel set so each workspace
+// gets its own entry; TTL from env (0 disables → always fresh). The web container is one process,
+// so a module-level cache is process-wide. A stable key needs the channel ids sorted (call sites may
+// pass them in any order).
+const webhookStatsCache = createTtlCache<WebhookStats>({ ttlMs: env.STATS_CACHE_TTL_MS });
+const channelKey = (channelIds: string[]): string => [...channelIds].sort().join(",");
+
+/** Aggregate inbound-event counts for the workspace's channels — the PRO Webhooks-page stats. */
+export async function loadWebhookStats(channelIds: string[]): Promise<WebhookStats> {
+  if (channelIds.length === 0) return { total: 0, last24h: 0, byStatus: {} };
+  return webhookStatsCache.getOrCompute(channelKey(channelIds), () => computeWebhookStats(channelIds));
+}
+
+async function computeWebhookStats(channelIds: string[]): Promise<WebhookStats> {
+  const since = new Date(Date.now() - 24 * 3600_000);
+  const live = await db
+    .select({ status: webhookEvents.handling_status, n: count() })
+    .from(webhookEvents)
+    .where(inArray(webhookEvents.channel_id, channelIds))
+    .groupBy(webhookEvents.handling_status);
+  const stats = await db
+    .select({ handling_status: webhookEventStats.handling_status, count: sql<number>`sum(${webhookEventStats.count})::int` })
+    .from(webhookEventStats)
+    .where(inArray(webhookEventStats.channel_id, channelIds))
+    .groupBy(webhookEventStats.handling_status);
+  const byStatus = mergeWebhookStatusCounts(
+    live.map((r) => ({ status: r.status, n: Number(r.n) })),
+    stats.map((r) => ({ handling_status: r.handling_status, count: Number(r.count) })),
+  );
+  const total = Object.values(byStatus).reduce((a, n) => a + n, 0);
+  const [recent] = await db
+    .select({ n: count() })
+    .from(webhookEvents)
+    .where(and(inArray(webhookEvents.channel_id, channelIds), gt(webhookEvents.received_at, since)));
+  return { total, last24h: Number(recent?.n ?? 0), byStatus };
+}
+
+function renderWebhookStats(s: WebhookStats): Html {
+  const tiles: Array<[string, number, Tone]> = [
+    ["Total received", s.total, "neutral"],
+    ["Last 24h", s.last24h, "info"],
+    ["Auto-replied", s.byStatus.fired ?? 0, "ok"],
+    ["Engagement (likes/reactions)", s.byStatus.recorded ?? 0, "info"],
+    ["No rule matched", s.byStatus.no_match ?? 0, "neutral"],
+    ["Errors", s.byStatus.error ?? 0, "neutral"],
+  ];
+  return html`<div class="kpis" style="grid-template-columns:repeat(auto-fit,minmax(150px,1fr));margin:.5rem 0 1rem">
+    ${tiles.map(([label, n, tone]) => kpi({ label, value: n, tone: label === "Errors" && n > 0 ? "bad" : tone }))}
+  </div>`;
+}
+
+// WHOBS1: a classified-but-unhandled inbound event type (an arriving webhook we log but don't act on
+// — e.g. a Meta field we have no handler for). Aggregate only: object/field/event_type + how many +
+// last seen. No payload/PII, so instance-wide channel-less rows are safe to surface here.
+export type UnhandledTypeRow = { object: string | null; field: string | null; eventType: string; count: number; lastAt: Date };
+
+/** WHOBS1: classified-but-unhandled inbound events (handling_status `unhandled` OR event_type
+ *  `unknown`) grouped by type, newest-first, so an arriving-but-unrouted webhook type is noticed.
+ *  Scope: the workspace's own channels PLUS instance-wide channel-less rows (test events / unknown
+ *  pages) — the grouped view exposes no payload, so this stays PII-safe. Read-only. */
+export async function loadUnhandledTypes(channelIds: string[]): Promise<UnhandledTypeRow[]> {
+  const scope = channelIds.length
+    ? or(isNull(webhookEvents.channel_id), inArray(webhookEvents.channel_id, channelIds))
+    : isNull(webhookEvents.channel_id);
+  const rows = await db
+    .select({
+      object: webhookEvents.object,
+      field: webhookEvents.field,
+      eventType: webhookEvents.event_type,
+      n: count(),
+      lastAt: sql<Date>`max(${webhookEvents.received_at})`,
+    })
+    .from(webhookEvents)
+    .where(and(
+      or(eq(webhookEvents.handling_status, "unhandled"), eq(webhookEvents.event_type, "unknown")),
+      scope,
+    ))
+    .groupBy(webhookEvents.object, webhookEvents.field, webhookEvents.event_type)
+    .orderBy(desc(sql`max(${webhookEvents.received_at})`))
+    .limit(50);
+  return rows.map((r) => ({ object: r.object, field: r.field, eventType: r.eventType, count: Number(r.n), lastAt: r.lastAt as Date }));
+}
+
+/** WHOBS1: the read-only "unhandled types" breakdown. Count + last-seen per type, no per-row raw view
+ *  (instance-wide rows carry no channel; the per-channel log above already opens channel events). */
+export function renderUnhandledTypes(rows: UnhandledTypeRow[]): Html {
+  if (rows.length === 0) {
+    return html`<p class="muted" style="font-size:.82rem">Nothing unrouted — every inbound event type arriving is being handled.</p>`;
+  }
+  return html`<div class="table-wrap"><table><thead><tr><th>Type</th><th>Count</th><th>Last seen</th></tr></thead>
+    <tbody>${rows.map(
+      (r) => html`<tr>
+        <td><span class="mono">${[PLATFORM_LABELS[r.object ?? ""] ?? r.object ?? "—", r.field, r.eventType].filter(Boolean).join(" · ")}</span></td>
+        <td><span class="mono">${r.count}</span></td>
+        <td><span class="muted-mono">${timeAgo(r.lastAt)}</span></td>
+      </tr>`,
+    )}</tbody></table></div>`;
+}
+
+// OBS1: one row of endpoint activity (a handshake or a rejected-before-record hit). These have no
+// channel and no event payload — only the status, a sanitized reason, and the body length.
+type WebhookEndpointRow = Pick<WebhookEventDetail, "id" | "event_type" | "object" | "handling_status" | "received_at" | "error_detail">;
+type HandlingStatus = WebhookEventDetail["handling_status"];
+
+function isEndpointStatus(s: string | undefined): s is (typeof WEBHOOK_ENDPOINT_STATUSES)[number] {
+  return !!s && (WEBHOOK_ENDPOINT_STATUSES as readonly string[]).includes(s);
+}
+
+/** OBS1: recent handshake + rejected-before-record hits — instance-wide (channel-less), newest first.
+ *  An optional `status` narrows to one outcome (the panel's filter). Read-only. */
+async function loadEndpointActivity(status?: string): Promise<WebhookEndpointRow[]> {
+  const where = isEndpointStatus(status)
+    ? eq(webhookEvents.handling_status, status)
+    : inArray(webhookEvents.handling_status, [...WEBHOOK_ENDPOINT_STATUSES] as HandlingStatus[]);
+  return db.query.webhookEvents.findMany({
+    where,
+    orderBy: [desc(webhookEvents.received_at)],
+    limit: 50,
+    columns: { id: true, event_type: true, object: true, handling_status: true, received_at: true, error_detail: true },
+  });
+}
+
+/** OBS1: the read-only endpoint-activity list + a status filter. Lazy-loaded into #wh-endpoint and
+ *  re-fetched on filter change (htmx), mirroring the subscriptions panel. */
+function renderEndpointActivity(rows: WebhookEndpointRow[], status?: string): Html {
+  const selected = isEndpointStatus(status) ? status : "";
+  const filter = html`<select class="input" name="status" style="max-width:240px;margin-bottom:.6rem"
+      hx-get="/webhooks/endpoint-activity" hx-target="#wh-endpoint" hx-swap="innerHTML" hx-trigger="change">
+    <option value=""${selected === "" ? " selected" : ""}>All endpoint hits</option>
+    ${WEBHOOK_ENDPOINT_STATUSES.map((s) => html`<option value="${s}"${s === selected ? " selected" : ""}>${s}</option>`)}
+  </select>`;
+  const body = rows.length === 0
+    ? html`<p class="muted" style="font-size:.85rem">No endpoint hits recorded${selected ? html` for <strong>${selected}</strong>` : html``} yet. Subscription handshakes and rejected (bad signature / unparseable / unknown object / oversized) requests show up here.</p>`
+    // SECURITY: e.object and e.error_detail originate from the UNAUTHENTICATED Meta webhook endpoint
+    // (payload.object / hub.mode) — i.e. attacker-controlled. They are stored HTML-neutralized at the
+    // write boundary (logWebhookMeta), AND must stay on the auto-escaping html`` tag below. NEVER
+    // render these via raw() — that would be stored XSS.
+    : html`<table><thead><tr><th>Status</th><th>Object</th><th>Detail</th><th>When</th></tr></thead>
+        <tbody>${rows.map((e) => html`<tr>
+          <td><span class="badge tone-${WEBHOOK_STATUS_TONE[e.handling_status] ?? "neutral"}">${e.handling_status}</span></td>
+          <td class="muted" style="font-size:.8rem">${e.object ?? "—"}</td>
+          <td class="muted" style="font-size:.78rem">${e.error_detail ?? "—"}</td>
+          <td class="muted">${timeAgo(e.received_at)}</td>
+        </tr>`)}</tbody></table>`;
+  return html`<div id="wh-endpoint">${filter}${body}</div>`;
+}
+
+/**
+ * The alert-webhook config form (PRO). Custom header VALUES are never echoed back — only their names
+ * (so the operator knows what's set without leaking secrets). Headers are entered as `Key: Value`
+ * lines; extra payload fields as a JSON object with {{placeholder}} tokens; field selection as a
+ * comma list (blank = send all standard fields).
+ */
+function renderAlertWebhook(cfg: AlertWebhookConfig | null, canConfigure: boolean, upgradeUrl: string, msg?: string): Html {
+  const notice = msg ? html`<div class="notice notice-ok">${msg}</div>` : html``;
+  if (!canConfigure) {
+    return html`${notice}<div class="callout">${icon("lock", "ico", 15)}<div>Configuring a proactive alert webhook is ${proLink(upgradeUrl, "PRO")}.</div></div>`;
+  }
+  const headerNames = cfg ? Object.keys(cfg.headers) : [];
+  const extraJson = cfg && Object.keys(cfg.extraFields).length ? JSON.stringify(cfg.extraFields, null, 2) : "";
+  const selection = cfg?.fieldSelection?.join(", ") ?? "";
+  const mono = "font-family:var(--font-mono);font-size:12.5px";
+  return html`${notice}
+    <form hx-post="/settings/alert-webhook" hx-ext="json-enc" hx-target="#alert-webhook-area" hx-swap="innerHTML" style="max-width:560px">
+      <label class="fld"><span>Webhook URL</span>
+        <input type="url" name="url" placeholder="https://hooks.example.com/alert" value="${cfg?.url ?? ""}" required style="${mono}" /></label>
+      <label class="compose-toggle"><input type="checkbox" name="enabled" value="true" ${cfg ? (cfg.enabled ? "checked" : "") : "checked"} /><span>Enabled</span></label>
+      <label class="fld"><span>Custom headers <small>— one <code>Key: Value</code> per line, encrypted at rest${headerNames.length ? html` · currently set: <strong>${headerNames.join(", ")}</strong> (re-enter to change)` : html``}</small></span>
+        <textarea name="headers" rows="2" placeholder="Authorization: Bearer xxx&#10;X-Api-Key: yyy" style="${mono}"></textarea></label>
+      <label class="fld"><span>Extra payload fields <small>— JSON; supports {{type}} {{display_name}} {{days_left}} {{detail}} {{expires_at}}</small></span>
+        <textarea name="extra" rows="3" placeholder='{ "to": "ops@example.com", "subject": "${BRAND.name}: {{type}} ({{days_left}}d)" }' style="${mono}">${extraJson}</textarea></label>
+      <label class="fld"><span>Only send these standard fields <small>— comma list, blank = all</small></span>
+        <input name="selection" placeholder="type, display_name, detail" value="${selection}" style="${mono}" /></label>
+      <div class="row" style="gap:.5rem">
+        <button class="btn btn-primary" type="submit">Save</button>
+        ${cfg ? html`<button class="btn btn-sm btn-danger" type="button" hx-delete="/settings/alert-webhook" hx-target="#alert-webhook-area" hx-swap="innerHTML" hx-confirm="Remove the alert webhook?">Remove</button>` : html``}
+      </div>
+    </form>`;
+}
+
+/**
+ * AIDRAFT1 (Task 8): the workspace-default AI-draft prompt form (PRO). This default is used whenever a
+ * channel has no per-channel prompt override; blank = the built-in default prompt. PRO-gated UI — a
+ * free instance sees an upsell instead of the textarea (the POST is also gated server-side).
+ */
+function renderAiDraftPrompt(promptDm: string | null, promptPublic: string | null, canConfigure: boolean, upgradeUrl: string, msg?: string, aiConfigured = true): Html {
+  const notice = msg ? html`<div class="notice notice-ok">${msg}</div>` : html``;
+  if (!canConfigure) {
+    return html`${notice}<div class="callout">${icon("lock", "ico", 15)}<div>A workspace-default AI-draft prompt is ${proLink(upgradeUrl, "PRO")}.</div></div>`;
+  }
+  // No provider key → the prompt is saved but nothing will run. Flag it where it's configured.
+  const aiOff = aiConfigured ? html`` : aiUnconfiguredBanner("AI drafts");
+  return html`${notice}${aiOff}
+    <form hx-post="/settings/ai-draft-prompt" hx-ext="json-enc" hx-target="#ai-draft-prompt-area" hx-swap="innerHTML" style="max-width:560px">
+      <label class="fld"><span>Default DM prompt <small>— used when a channel has no DM prompt override; blank = the built-in default below</small></span>
+        <textarea name="ai_draft_prompt_dm" rows="4" maxlength="4000" placeholder="${DEFAULT_DRAFT_PROMPT}" style="font:inherit">${promptDm ?? ""}</textarea></label>
+      <label class="fld" style="margin-top:.6rem"><span>Default public comment prompt <small>— used when a channel has no public comment prompt override; blank = the built-in default below</small></span>
+        <textarea name="ai_draft_prompt_public" rows="4" maxlength="4000" placeholder="${DEFAULT_DRAFT_PROMPT}" style="font:inherit">${promptPublic ?? ""}</textarea></label>
+      <p class="muted" style="font-size:.78rem;margin:.25rem 0 0">Built-in default (used when both are blank): <span class="mono">${DEFAULT_DRAFT_PROMPT}</span></p>
+      <div class="row"><button class="btn btn-primary" type="submit">Save</button></div>
+    </form>`;
+}
+
+/**
+ * AIPROMPT1: the workspace-default rephrase prompt form (PRO). Used when a rule's `custom_prompt` is
+ * blank; blank here = the built-in default rephrase prompt (shown as the textarea placeholder so the
+ * operator always sees what will run if left empty — AIPROMPT2). PRO-gated UI + server-side gate.
+ */
+function renderAiRephrasePrompt(prompt: string | null, canConfigure: boolean, upgradeUrl: string, msg?: string, aiConfigured = true): Html {
+  const notice = msg ? html`<div class="notice notice-ok">${msg}</div>` : html``;
+  if (!canConfigure) {
+    return html`${notice}<div class="callout">${icon("lock", "ico", 15)}<div>A workspace-default rephrase prompt is ${proLink(upgradeUrl, "PRO")}.</div></div>`;
+  }
+  const aiOff = aiConfigured ? html`` : aiUnconfiguredBanner("AI rephrasing");
+  return html`${notice}${aiOff}
+    <form hx-post="/settings/ai-rephrase-prompt" hx-ext="json-enc" hx-target="#ai-rephrase-prompt-area" hx-swap="innerHTML" style="max-width:560px">
+      <label class="fld"><span>Default rephrase prompt <small>— used when a rule has no custom prompt; blank = the built-in default below</small></span>
+        <textarea name="ai_rephrase_prompt" rows="4" maxlength="4000" placeholder="${DEFAULT_REPHRASE_PROMPT}" style="font:inherit">${prompt ?? ""}</textarea></label>
+      <p class="muted" style="font-size:.78rem;margin:.25rem 0 0">Built-in default (used when blank): <span class="mono">${DEFAULT_REPHRASE_PROMPT}</span></p>
+      <div class="row"><button class="btn btn-primary" type="submit">Save</button></div>
+    </form>`;
+}
+
+/**
+ * AIPROMPT1: per-rule rephrase override fields (Tone + Custom prompt), shown only when the rephrase
+ * toggle is on (`aiRephrase` Alpine state). `:disabled="!aiRephrase"` so stale values aren't submitted
+ * when the toggle is off. The custom-prompt placeholder + the hint show what applies when left blank
+ * (workspace default → built-in default) — AIPROMPT2 visibility. Shared by the create + edit forms.
+ */
+function rephrasePromptFields(tone: string | null, customPrompt: string | null, aiConfigured = true): Html {
+  const aiOff = aiConfigured ? html`` : aiUnconfiguredBanner("rephrasing");
+  return html`<div x-show="responseMode === 'text' && aiRephrase" x-cloak class="card" style="display:grid;gap:.5rem;margin:.25rem 0">
+    ${aiOff}
+    <label class="fld"><span>Tone <small>— optional; steers the built-in prompt (e.g. casual, warm)</small></span>
+      <input class="input" name="tone" maxlength="100" placeholder="${DEFAULT_REPHRASE_TONE}" value="${tone ?? ""}" :disabled="!aiRephrase" /></label>
+    <label class="fld"><span>Custom prompt <small>— optional; fully overrides the prompt. Blank = your workspace default (Settings → Automation), or the built-in default below</small></span>
+      <textarea class="input" name="custom_prompt" rows="3" maxlength="2000" placeholder="${DEFAULT_REPHRASE_PROMPT}" style="font:inherit" :disabled="!aiRephrase">${customPrompt ?? ""}</textarea></label>
+  </div>`;
+}
+
+// ─── registration ─────────────────────────────────────────────────────────────
+
+/**
+ * Turn a delegated API response into an error notice (or undefined on success). A swallowed `null`
+ * (the delegated call threw) and any >=400 both surface a message — preferring the API's own error
+ * text — so a destructive/approval action that failed isn't silently re-rendered as if it worked.
+ */
+async function noticeFrom(res: Response | null, fallback: string): Promise<string | undefined> {
+  if (res && res.status < 400) return undefined;
+  if (!res) return fallback;
+  const body = (await res.json().catch(() => null)) as { error?: { message?: string } } | null;
+  return body?.error?.message ?? fallback;
+}
+
+export function registerDashboard(app: Hono, sessionGuard: MiddlewareHandler): void {
+  // Every dashboard route runs the first-party origin check (a no-op on safe methods) before the
+  // session check, so a cross-site write is refused even before auth runs.
+  const guard = every(requireSameOrigin, sessionGuard);
+  // Outbound webhook endpoints — register BEFORE the `/webhooks/:id` inbound-event route so its static
+  // `/webhooks/outbound*` paths aren't captured by the `:id` param (mirrors endpoint-activity / subscriptions).
+  registerWebhooksOutbound(app, guard);
+  // Overview — the free landing: aggregate counters + an identity-free recent-sends log.
+  app.get("/overview", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.redirect("/login");
+    const { features, upgradeUrl, products } = await getInstanceLicense();
+    const [ov, responseTimes] = await Promise.all([
+      loadOverview(a.workspaceId),
+      getResponseTimeStats(db, { workspaceId: a.workspaceId, windowDays: DEFAULT_WINDOW_DAYS }),
+    ]);
+    // When the publishing wing is entitled, fold its KPIs (attention / upcoming / events) into the
+    // unified overview alongside the reply stats (workspace-scoped). Otherwise it's the reply landing.
+    const pub = products.has("publishing")
+      ? await (async () => {
+          const [attention, upcoming, recent] = await Promise.all([
+            gatherAttention(a.workspaceId),
+            upcomingScheduled(a.workspaceId, 6),
+            recentEvents(a.workspaceId, 8),
+          ]);
+          return { attention, upcoming, recent };
+        })()
+      : null;
+    return c.html(dashboardDoc(t("title.suffix", { section: "Overview" }), "/overview", renderOverview(ov, features, upgradeUrl, pub, responseTimes), features, products));
+  });
+
+  // Inbox — READING incoming conversations is free (basic info; rules auto-reply for free). Only the
+  // human-reply box is PRO (manual_reply), gated in renderThread + on the send endpoint. The richer
+  // contacts CRM (tags/assignment, /contacts) stays PRO (contacts_crm).
+  app.get("/inbox", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.redirect("/login");
+    const { features, products } = await getInstanceLicense();
+    const filter = parseConvFilter(c.req.query("filter"));
+    const channelId = c.req.query("channel") || "all";
+    const contactId = c.req.query("contact") || "all";
+    const search = c.req.query("search") || "";
+    const since = parseConvSince(c.req.query("since"));
+    const from = c.req.query("from") || "";
+    const to = c.req.query("to") || "";
+    // Deep-link to a specific thread (e.g. "open in inbox" from Approvals): the #thread pane
+    // self-loads that conversation on page load. The /inbox/:id endpoint scopes it to the workspace.
+    const open = (c.req.query("open") || "").trim();
+    const [conversations, chans, doneCount] = await Promise.all([
+      loadConversations(a.workspaceId, filter, channelId, contactId, search, since, from, to),
+      loadInboxChannels(a.workspaceId),
+      loadDoneCount(a.workspaceId, channelId, contactId),
+    ]);
+    return c.html(
+      dashboardDoc(
+        t("title.suffix", { section: "Inbox" }),
+        "/inbox",
+        html`<div class="inbox">
+          <div id="conv-panel" class="conv-list"
+            hx-get="/inbox/list?filter=${filter}&channel=${channelId}&contact=${contactId}&search=${encodeURIComponent(search)}&since=${since}&from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}"
+            hx-trigger="sse:comment from:body, sse:message from:body, sse:reaction from:body"
+            hx-swap="innerHTML">${renderConvPanel(conversations, filter, channelId, chans, contactId, search, since, from, to, doneCount)}</div>
+          ${open
+            ? html`<div id="thread" class="thread" hx-get="/inbox/${open}" hx-trigger="load" hx-swap="innerHTML"><div class="thread-empty">Loading…</div></div>`
+            : html`<div id="thread" class="thread"><div class="thread-empty">Select a conversation</div></div>`}
+        </div>`,
+        features,
+        products,
+      ),
+    );
+  });
+
+  // htmx: re-render the whole left panel (tabs + channel dropdown + rows) on a filter/channel change.
+  app.get("/inbox/list", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const filter = parseConvFilter(c.req.query("filter"));
+    const channelId = c.req.query("channel") || "all";
+    const contactId = c.req.query("contact") || "all";
+    const search = c.req.query("search") || "";
+    const since = parseConvSince(c.req.query("since"));
+    const from = c.req.query("from") || "";
+    const to = c.req.query("to") || "";
+    const [conversations, chans, doneCount] = await Promise.all([
+      loadConversations(a.workspaceId, filter, channelId, contactId, search, since, from, to),
+      loadInboxChannels(a.workspaceId),
+      loadDoneCount(a.workspaceId, channelId, contactId),
+    ]);
+    return c.html(renderConvPanel(conversations, filter, channelId, chans, contactId, search, since, from, to, doneCount));
+  });
+
+  app.get("/inbox/:id", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) {
+      // A direct (non-htmx) navigation must land on the login page, not get a bare 401 fragment.
+      return c.req.header("hx-request") === "true" ? c.body(null, 401, { "HX-Redirect": "/login" }) : c.redirect("/login");
+    }
+    const { features, products, upgradeUrl } = await getInstanceLicense();
+    const aiConfigured = await isAiConfigured();
+    const id = c.req.param("id");
+    const conv = await loadConversation(id, a.workspaceId);
+    if (!conv) return c.notFound();
+    // workspace_id alongside the PK keeps the unread reset tenant-scoped.
+    await db.update(conversations).set({ unread_count: 0 }).where(and(eq(conversations.id, id), eq(conversations.workspace_id, a.workspaceId))).catch(() => {});
+    const [msgs, drafts] = await Promise.all([loadMessages(id), loadDrafts(id, a.workspaceId)]);
+    const thread = renderThread(conv, msgs, { canReply: features.has("manual_reply"), canAiDraft: features.has("ai_draft"), aiConfigured, upgradeUrl, drafts });
+
+    // htmx swaps the bare thread into #thread; a DIRECT navigation (e.g. the deep-link from a webhook
+    // event's "Conversation →") must render the FULL inbox page with this thread open — otherwise the
+    // user lands on an unstyled fragment.
+    if (c.req.header("hx-request") === "true") return c.html(thread);
+
+    const [convList, chans, doneCount] = await Promise.all([
+      loadConversations(a.workspaceId, "open", "all", "all"),
+      loadInboxChannels(a.workspaceId),
+      loadDoneCount(a.workspaceId),
+    ]);
+    return c.html(
+      dashboardDoc(
+        t("title.suffix", { section: "Inbox" }),
+        "/inbox",
+        html`<div class="inbox">
+          <div id="conv-panel" class="conv-list"
+            hx-get="/inbox/list?filter=open&channel=all&contact=all"
+            hx-trigger="sse:comment from:body, sse:message from:body, sse:reaction from:body"
+            hx-swap="innerHTML">${renderConvPanel(convList, "open", "all", chans, "all", "", "", "", "", doneCount)}</div>
+          <div id="thread" class="thread">${thread}</div>
+        </div>`,
+        features,
+        products,
+      ),
+    );
+  });
+
+  app.get("/inbox/:id/messages", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const id = c.req.param("id");
+    // Load the full conversation (not just the type) so an email thread's poll re-render keeps the
+    // sender identity on each card — the message rows themselves carry no per-row from-name/address.
+    const conv = await loadConversation(id, a.workspaceId);
+    if (!conv) return c.notFound();
+    const ctx: ThreadContext = { name: contactName(conv), handle: contactHandle(conv) };
+    return c.html(renderMessages(await loadMessages(id), conv.thread_type, ctx));
+  });
+
+  // Self-terminating poll target for a just-requested AI draft (see renderDraftsRegion). Each hit
+  // either finds the drafted approval (renders it, no more hx-get -> polling stops) or re-schedules
+  // itself with attempt+1, capped at MAX_DRAFT_POLL_ATTEMPTS.
+  app.get("/inbox/:id/drafts", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const id = c.req.param("id");
+    const conv = await loadConversation(id, a.workspaceId);
+    if (!conv) return c.notFound();
+    const attempt = Number(c.req.query("attempt"));
+    const since = Number(c.req.query("since"));
+    return c.html(renderDraftsRegion(await loadDrafts(id, a.workspaceId), id, {
+      attempt: Number.isFinite(attempt) && attempt > 0 ? attempt : 0,
+      expectMoreThan: Number.isFinite(since) && since >= 0 ? since : 0,
+    }));
+  });
+
+  app.post("/inbox/:id/reply", guard, async (c) => {
+    const id = c.req.param("id");
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const draft = typeof form.text === "string" ? form.text : "";
+    // Inspect the send result instead of swallowing it: a rejected reply (channel needs_reauth,
+    // empty/over-long text, no platform identity) must surface an error and keep the draft, not
+    // clear the box as if it sent.
+    const res = await conversationMessages
+      .POST(jsonReq(c, { text: draft }), { params: Promise.resolve({ conversationId: id }) })
+      .catch(() => null);
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const { features, upgradeUrl } = await getInstanceLicense();
+    const aiConfigured = await isAiConfigured();
+    const canReply = features.has("manual_reply");
+    const conv = await loadConversation(id, a.workspaceId);
+    if (!conv) return c.notFound();
+    const drafts = await loadDrafts(id, a.workspaceId);
+    if (!res || res.status >= 400) {
+      const errBody = res ? ((await res.json().catch(() => null)) as { error?: { message?: string } } | null) : null;
+      const error = errBody?.error?.message ?? "Could not send the reply. Please try again.";
+      return c.html(renderThread(conv, await loadMessages(id), { error, draft, canReply, canAiDraft: features.has("ai_draft"), aiConfigured, upgradeUrl, drafts }));
+    }
+    return c.html(renderThread(conv, await loadMessages(id), { canReply, canAiDraft: features.has("ai_draft"), aiConfigured, upgradeUrl, drafts }));
+  });
+
+  // Conversation controls: status (close/snooze/reopen) + automation pause toggle, delegated to the
+  // PATCH /conversations/:id API and re-rendering the thread.
+  app.post("/inbox/:id/conversation", guard, async (c) => {
+    const id = c.req.param("id");
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const patch: Record<string, unknown> = {};
+    if (typeof form.status === "string") patch.status = form.status;
+    if (typeof form.is_automation_paused === "boolean") patch.is_automation_paused = form.is_automation_paused;
+    const res = await conversation
+      .PATCH(jsonReqMethod(c, "PATCH", patch), { params: Promise.resolve({ conversationId: id }) })
+      .catch(() => null);
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const { features, upgradeUrl } = await getInstanceLicense();
+    const aiConfigured = await isAiConfigured();
+    const conv = await loadConversation(id, a.workspaceId);
+    if (!conv) return c.notFound();
+    const error = !res || res.status >= 400 ? await noticeFrom(res, "Could not update the conversation.") : undefined;
+    return c.html(renderThread(conv, await loadMessages(id), { error, canReply: features.has("manual_reply"), canAiDraft: features.has("ai_draft"), aiConfigured, upgradeUrl, drafts: await loadDrafts(id, a.workspaceId) }));
+  });
+
+  // On-demand AI draft (PRO): the inbox "Generate reply" button. Enqueues an `ai-draft` job with
+  // source `ai_manual`, which the worker ALWAYS parks for approval (never autosends). Workspace-scoped
+  // conversation load, server-side PRO gate, target validation. Re-renders the thread + fires a toast.
+  app.post("/inbox/:id/ai-draft", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const id = c.req.param("id");
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(id)) return c.notFound();
+    const conv = await loadConversation(id, a.workspaceId);
+    if (!conv) return c.notFound();
+
+    const { features, upgradeUrl } = await getInstanceLicense();
+    const aiConfigured = await isAiConfigured();
+    const canReply = features.has("manual_reply");
+
+    // Server-side PRO gate — a forged POST from a free instance never enqueues. Runs BEFORE the
+    // target validation so a free instance gets the 403 PRO response, not a 422 on a bad target
+    // (the feature, not the payload, is the reason it's rejected).
+    if (!features.has("ai_draft")) {
+      toastHeader(c, "warn", "AI-drafted replies are a PRO feature.");
+      return c.html(
+        html`<div class="notice notice-warn">AI-drafted replies are a <strong>PRO</strong> feature. <a href="${upgradeUrl}" target="_blank" rel="noopener">Upgrade to PRO</a></div>`,
+        403,
+      );
+    }
+
+    // Even with the PRO feature, AI can't run without a provider key — don't promise a draft that
+    // never appears (the worker would only log "empty generation — nothing parked"). Tell the
+    // operator and re-render with the buttons disabled. Mirrors the API's `ai_configured=false`.
+    if (!aiConfigured) {
+      toastHeader(c, "warn", "AI provider not configured - set an API key in Settings.");
+      return c.html(renderThread(conv, await loadMessages(id), { canReply, canAiDraft: true, aiConfigured, upgradeUrl, drafts: await loadDrafts(id, a.workspaceId) }));
+    }
+
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const isComment = conv.thread_type === "comment";
+    // "public" only makes sense on a comment thread (the worker addresses the comment).
+    const target: "dm" | "public" | null = form.target === "dm" ? "dm" : form.target === "public" && isComment ? "public" : null;
+    if (!target) {
+      toastHeader(c, "bad", "Pick a valid reply target.");
+      return c.body(null, 422);
+    }
+
+    // The thing to reply to. The two thread types store their inbound content in DIFFERENT tables:
+    // a DM lives in `messages`; a comment lives in `commentLogs` (a comment thread has NO messages
+    // rows). Source from the right table, and forward the comment id so the worker can address the
+    // public reply / first-touch DM.
+    let incomingText: string | undefined;
+    let commentId: string | undefined;
+    let postId: string | undefined;
+    if (isComment) {
+      const lastComment = await db.query.commentLogs.findFirst({
+        where: eq(commentLogs.conversation_id, id),
+        orderBy: desc(commentLogs.created_at),
+        columns: { comment_text: true, platform_comment_id: true, post_id: true },
+      });
+      incomingText = lastComment?.comment_text?.trim();
+      commentId = lastComment?.platform_comment_id ?? undefined;
+      postId = lastComment?.post_id ?? undefined;
+    } else {
+      const lastInbound = await db.query.messages.findFirst({
+        where: and(eq(messages.conversation_id, id), eq(messages.direction, "inbound")),
+        orderBy: desc(messages.created_at),
+        columns: { text: true },
+      });
+      incomingText = lastInbound?.text?.trim();
+    }
+    if (!incomingText) {
+      toastHeader(c, "warn", "Nothing to reply to yet.");
+      return c.html(renderThread(conv, await loadMessages(id), { canReply, canAiDraft: true, aiConfigured, upgradeUrl, drafts: await loadDrafts(id, a.workspaceId) }));
+    }
+    if (target === "public" && !commentId) {
+      toastHeader(c, "bad", "No comment to reply to here.");
+      return c.body(null, 422);
+    }
+
+    // Address the recipient the SAME way a manual reply does: the contact's platform identity on
+    // THIS conversation's channel (contact_id + channel_id), not the first contact_channel of any
+    // channel. A stored approval keeps this recipient, so a later Accept sends to the right PSID
+    // rather than an empty string. If genuinely unresolved it falls back to "" — manual drafts always
+    // park (approve uses the stored row), so a missing identity surfaces at send, not silently here.
+    const recipientChannel = await db.query.contactChannels.findFirst({
+      where: and(eq(contactChannels.contact_id, conv.contact.id), eq(contactChannels.channel_id, conv.channel.id)),
+      columns: { platform_sender_id: true },
+    });
+    // ADCTX1+ADCTX2+ADCTX3: post caption (comment threads only) + recent conversation history, as
+    // ONE context string — the exact same builder the automatic no-match path uses (rules/executor.ts),
+    // so the on-demand button and the auto pipeline can never construct context differently.
+    const context = await buildDraftContext({ workspaceId: a.workspaceId, channelId: conv.channel.id, conversationId: id, isComment, postId });
+
+    await addJobTx(db, "ai-draft", {
+      workspaceId: a.workspaceId,
+      channelId: conv.channel.id,
+      conversationId: id,
+      contactId: conv.contact.id,
+      recipientPlatformId: recipientChannel?.platform_sender_id ?? "",
+      incomingText,
+      isComment,
+      target,
+      ...(commentId ? { commentId } : {}),
+      ...(context ? { context } : {}),
+      source: "ai_manual",
+    });
+
+    toastHeader(c, "ok", "Draft requested - it'll appear here for approval.");
+    // The job runs async (worker), so its result isn't in `drafts` yet — start the self-terminating
+    // poll (renderDraftsRegion), waiting for the count to grow past however many already existed
+    // (an earlier, still-unapproved draft on this same conversation must keep showing, not vanish).
+    const drafts = await loadDrafts(id, a.workspaceId);
+    return c.html(renderThread(conv, await loadMessages(id), { canReply, canAiDraft: true, aiConfigured, upgradeUrl, drafts, pollDrafts: drafts.length }));
+  });
+
+  // In-thread approval drafts (rule-holds + AI drafts shown as bubbles in the inbox). Accept/Reject
+  // REUSE the v1 approve/reject handlers (the same send/consent/charge-in-one-tx path the Approvals
+  // tab uses) but re-render the THREAD instead of the approvals list. Edit updates the parked
+  // proposed_content text in place (workspace-scoped) and re-renders — it never sends.
+  const reRenderThreadForConv = async (c: Context, a: AuthContext, convId: string, error?: string) => {
+    const { features, upgradeUrl } = await getInstanceLicense();
+    const aiConfigured = await isAiConfigured();
+    const conv = await loadConversation(convId, a.workspaceId);
+    if (!conv) return c.notFound();
+    const [msgs, drafts] = await Promise.all([loadMessages(convId), loadDrafts(convId, a.workspaceId)]);
+    return c.html(renderThread(conv, msgs, { canReply: features.has("manual_reply"), canAiDraft: features.has("ai_draft"), aiConfigured, upgradeUrl, drafts, error }));
+  };
+
+  // Resolve a pending approval to its conversation, workspace-scoped — a foreign/missing row → 404
+  // before any handler runs.
+  const approvalConv = async (id: string, workspaceId: string) =>
+    db.query.pendingApprovals.findFirst({
+      where: and(eq(pendingApprovals.id, id), eq(pendingApprovals.workspace_id, workspaceId)),
+      columns: { conversation_id: true, proposed_content: true },
+    });
+
+  // ADUX2: shared by the inbox-thread edit route and the /approvals page edit route (DRY) — one
+  // edited text feeds whichever parts the parked reply has (a DM body and/or a public-comment
+  // reply). Blank text is a silent no-op (the textarea is `required`, so this only guards a
+  // direct/malformed POST). Only updates while still `status='pending'` — a row a concurrent
+  // approve/reject already resolved is left untouched.
+  const updateProposedText = async (workspaceId: string, id: string, proposedContent: unknown, text: string): Promise<void> => {
+    if (!text) return;
+    const pc = (proposedContent ?? {}) as ProposedContent;
+    const next: ProposedContent = { ...pc };
+    if (next.content) next.content = { ...next.content, text };
+    if (next.comment) next.comment = { ...next.comment, text };
+    if (!next.content && !next.comment) next.content = { text };
+    await db
+      .update(pendingApprovals)
+      .set({ proposed_content: next })
+      .where(and(eq(pendingApprovals.id, id), eq(pendingApprovals.workspace_id, workspaceId), eq(pendingApprovals.status, "pending")));
+  };
+
+  // ADDEL1: hard-delete a draft/approval — used by the "Delete" button in the inbox thread, on the
+  // Approvals page, and in its "Recently resolved" history. The inbox thread and Approvals page both
+  // render the SAME pendingApprovals row, so one delete clears it from both surfaces at once. Any
+  // status (not just pending) — a resolved row can be purged from history too. Does NOT touch the
+  // underlying commentLogs/messages that triggered the draft — only the draft/approval entry itself.
+  const deletePendingApproval = async (workspaceId: string, id: string): Promise<boolean> => {
+    const deleted = await db
+      .delete(pendingApprovals)
+      .where(and(eq(pendingApprovals.id, id), eq(pendingApprovals.workspace_id, workspaceId)))
+      .returning({ id: pendingApprovals.id });
+    return deleted.length > 0;
+  };
+
+  app.post("/inbox/approval/:id/approve", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const id = c.req.param("id");
+    const appr = await approvalConv(id, a.workspaceId);
+    if (!appr) return c.notFound();
+    const res = await approvalApprove.POST(jsonReq(c, {}), { params: Promise.resolve({ approvalId: id }) }).catch(() => null);
+    return reRenderThreadForConv(c, a, appr.conversation_id, await noticeFrom(res, "Could not approve — the reply was not sent."));
+  });
+
+  app.post("/inbox/approval/:id/reject", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const id = c.req.param("id");
+    const appr = await approvalConv(id, a.workspaceId);
+    if (!appr) return c.notFound();
+    const res = await approvalReject.POST(jsonReq(c, {}), { params: Promise.resolve({ approvalId: id }) }).catch(() => null);
+    return reRenderThreadForConv(c, a, appr.conversation_id, await noticeFrom(res, "Could not reject the reply."));
+  });
+
+  app.post("/inbox/approval/:id/edit", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const id = c.req.param("id");
+    const appr = await approvalConv(id, a.workspaceId);
+    if (!appr) return c.notFound();
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const text = typeof form.text === "string" ? form.text.trim() : "";
+    await updateProposedText(a.workspaceId, id, appr.proposed_content, text);
+    return reRenderThreadForConv(c, a, appr.conversation_id);
+  });
+
+  // ADDEL1: delete a draft/approval entirely from the inbox thread (hx-confirm on the button).
+  app.delete("/inbox/approval/:id", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const id = c.req.param("id");
+    const appr = await approvalConv(id, a.workspaceId);
+    if (!appr) return c.notFound();
+    await deletePendingApproval(a.workspaceId, id);
+    return reRenderThreadForConv(c, a, appr.conversation_id);
+  });
+
+  // Connect a channel with a pasted long-lived / System User token. On success the unified channels
+  // page reloads (HX-Redirect); on failure a small inline error is returned (no list — the list lives
+  // on the dedicated /channels page now).
+  app.post("/channels/connect-token", guard, async (c) => {
+    const res = await channelConnectToken.POST(c.req.raw);
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    if (res.status >= 400) {
+      const body = await res.json().catch(() => ({}));
+      return c.html(html`<div class="auth-error">${body?.error?.message ?? "Could not connect with this token."}</div>`);
+    }
+    c.header("HX-Redirect", "/channels");
+    return c.body(null, 200);
+  });
+
+  app.post("/channels/telegram/connect", guard, async (c) => {
+    const res = await channelTelegram.POST(c.req.raw);
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    if (res.status >= 400) {
+      const body = await res.json().catch(() => ({}));
+      return c.html(html`<div class="auth-error">${body?.error?.message ?? "Could not connect the Telegram bot."}</div>`);
+    }
+    c.header("HX-Redirect", "/channels");
+    return c.body(null, 200);
+  });
+
+  // Contacts — the customer CRM; seeing individual people is PRO.
+  app.get("/contacts", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.redirect("/login");
+    const { features, upgradeUrl, products } = await getInstanceLicense();
+    if (!features.has("contacts_crm")) {
+      return c.html(
+        dashboardDoc(t("title.suffix", { section: "Contacts" }), "/contacts", proLockMain("Contacts", html`The contacts CRM is a PRO feature.`, upgradeUrl), features, products),
+      );
+    }
+    const chans = await loadInboxChannels(a.workspaceId);
+    const platforms = [...new Set(chans.map((ch) => ch.platform))];
+    // Brand filter — only when the license allows multiple brands and the workspace actually has some.
+    const brandList = features.has("multi_brand") ? await listBrands(a.workspaceId) : [];
+    return c.html(
+      dashboardDoc(
+        t("title.suffix", { section: "Contacts" }),
+        "/contacts",
+        html`<div class="page" style="max-width:900px">
+          <h1>Contacts</h1>
+          <p class="muted">Everyone who has messaged your connected pages. Contacts are assigned to a channel automatically.</p>
+          <form class="row" style="gap:.5rem;margin:1rem 0;flex-wrap:wrap;align-items:center">
+            <input class="input" style="max-width:340px" type="search" name="q" placeholder="Search by name, email, username..."
+              hx-get="/contacts/list" hx-trigger="keyup changed delay:300ms, search" hx-target="#contacts-list" hx-swap="innerHTML" hx-include="closest form" />
+            ${brandList.length > 0
+              ? html`<select class="input" name="brand" style="max-width:200px;font-size:.85rem" hx-get="/contacts/list" hx-trigger="change" hx-target="#contacts-list" hx-swap="innerHTML" hx-include="closest form">
+                  <option value="all">All brands</option>
+                  ${brandList.map((b) => html`<option value="${b.key}">${b.name}</option>`)}
+                </select>`
+              : html``}
+            ${chans.length > 1
+              ? html`<select class="input" name="channel" style="max-width:220px;font-size:.85rem" hx-get="/contacts/list" hx-trigger="change" hx-target="#contacts-list" hx-swap="innerHTML" hx-include="closest form">
+                  <option value="all">All channels</option>
+                  ${chans.map((ch) => html`<option value="${ch.id}">${PLATFORM_LABELS[ch.platform] ?? ch.platform} · ${ch.display_name ?? ch.username ?? ch.id}</option>`)}
+                </select>`
+              : html``}
+            ${platforms.length > 1
+              ? html`<select class="input" name="platform" style="max-width:160px;font-size:.85rem" hx-get="/contacts/list" hx-trigger="change" hx-target="#contacts-list" hx-swap="innerHTML" hx-include="closest form">
+                  <option value="all">All platforms</option>
+                  ${platforms.map((p) => html`<option value="${p}">${PLATFORM_LABELS[p] ?? p}</option>`)}
+                </select>`
+              : html``}
+          </form>
+          <div id="contacts-list">${renderContacts(await loadContacts(a.workspaceId, ""))}</div>
+        </div>`,
+        features,
+        products,
+      ),
+    );
+  });
+
+  // Engagement — post reactions/likes; the customer-engagement surface is PRO.
+  app.get("/engagement", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.redirect("/login");
+    const { features, upgradeUrl, products } = await getInstanceLicense();
+    if (!features.has("contacts_crm")) {
+      return c.html(
+        dashboardDoc(t("title.suffix", { section: "Engagement" }), "/engagement", proLockMain("Engagement", html`Seeing who reacted to your posts is a PRO feature.`, upgradeUrl), features, products),
+      );
+    }
+    const brandParam = c.req.query("brand") || "all";
+    const channelParam = c.req.query("channel") || "all";
+    const [wsChannels, brands] = await Promise.all([loadInboxChannels(a.workspaceId), listBrands(a.workspaceId)]);
+    // Resolve the brand/account filter to a concrete channel-id set (null = all, [] = nothing).
+    let channelIds: string[] | null = null;
+    if (channelParam !== "all") {
+      channelIds = wsChannels.some((ch) => ch.id === channelParam) ? [channelParam] : [];
+    } else if (brandParam !== "all") {
+      const key = brandParam === "__unassigned__" ? null : brandParam;
+      channelIds = wsChannels.filter((ch) => (ch.brand_key ?? null) === key).map((ch) => ch.id);
+    }
+    const [posts, dms] = await Promise.all([
+      loadEngagement(a.workspaceId, channelIds),
+      loadMessageReactions(a.workspaceId, channelIds),
+    ]);
+    return c.html(
+      dashboardDoc(
+        t("title.suffix", { section: "Engagement" }),
+        "/engagement",
+        renderEngagement(posts, dms, { channels: wsChannels, brands, brand: brandParam, channel: channelParam }),
+        features,
+        products,
+      ),
+    );
+  });
+
+  app.get("/contacts/list", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const { features } = await getInstanceLicense();
+    if (!features.has("contacts_crm")) return c.body(null, 402);
+    const q = c.req.query("q") ?? "";
+    const channelId = c.req.query("channel") || "all";
+    const platform = c.req.query("platform") || "all";
+    // The brand dimension is a multi_brand (PRO) capability; ignore it on instances without the feature.
+    const brand = features.has("multi_brand") ? (c.req.query("brand") || "all") : "all";
+    // "Load more" grows the page (capped) so a workspace with >50 contacts is browsable.
+    const limit = Math.min(Math.max(Number(c.req.query("limit")) || 50, 50), 1000);
+    return c.html(renderContacts(await loadContacts(a.workspaceId, q, limit, channelId, platform, brand), q, limit, channelId, platform, brand));
+  });
+
+  // Settings
+  app.post("/settings/alert-webhook", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const license = await getInstanceLicense();
+    const canAlerts = license.features.has("managed_connection");
+    if (!canAlerts) return c.html(renderAlertWebhook(null, false, license.upgradeUrl));
+
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const url = typeof form.url === "string" ? form.url.trim() : "";
+    if (!/^https?:\/\//.test(url)) {
+      return c.html(renderAlertWebhook(await getAlertWebhook(a.workspaceId), true, license.upgradeUrl, "Enter a valid http(s) URL — nothing saved."));
+    }
+    let extraFields: Record<string, unknown> = {};
+    if (typeof form.extra === "string" && form.extra.trim()) {
+      try {
+        const parsed = JSON.parse(form.extra);
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) extraFields = parsed as Record<string, unknown>;
+      } catch {
+        return c.html(renderAlertWebhook(await getAlertWebhook(a.workspaceId), true, license.upgradeUrl, "Extra fields must be valid JSON — nothing saved."));
+      }
+    }
+    const headerLines = typeof form.headers === "string" ? parseHeaderLines(form.headers) : {};
+    const selection = typeof form.selection === "string" && form.selection.trim()
+      ? form.selection.split(",").map((s) => s.trim()).filter(Boolean)
+      : null;
+    // Preserve previously-saved headers when the textarea is left blank (values are never echoed back).
+    const existing = await getAlertWebhook(a.workspaceId);
+    const headers = Object.keys(headerLines).length ? headerLines : existing?.headers;
+
+    await upsertAlertWebhook(a.workspaceId, {
+      url,
+      enabled: form.enabled === "true" || form.enabled === true,
+      headers,
+      extraFields,
+      fieldSelection: selection,
+    });
+    return c.html(renderAlertWebhook(await getAlertWebhook(a.workspaceId), true, license.upgradeUrl, "Alert webhook saved."));
+  });
+
+  app.delete("/settings/alert-webhook", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const license = await getInstanceLicense();
+    await deleteAlertWebhook(a.workspaceId);
+    return c.html(renderAlertWebhook(null, license.features.has("managed_connection"), license.upgradeUrl, "Alert webhook removed."));
+  });
+
+  // AIDRAFT1 (Task 8): persist the workspace-default AI-draft prompt (PRO). Blank → null (built-in
+  // default). Server-side PRO gate — a forged POST from a free instance is refused (403, no write).
+  app.post("/settings/ai-draft-prompt", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const license = await getInstanceLicense();
+    if (!license.features.has("ai_draft")) {
+      return c.html(renderAiDraftPrompt(null, null, false, license.upgradeUrl), 403);
+    }
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    // Cap at 4000 chars for parity with the per-channel prompt (channels/service.ts) — both feed the
+    // same LLM prompt builder, so an unbounded workspace default must not slip past the channel cap.
+    const rawDm = typeof form.ai_draft_prompt_dm === "string" ? form.ai_draft_prompt_dm.trim().slice(0, 4000) : "";
+    const rawPublic = typeof form.ai_draft_prompt_public === "string" ? form.ai_draft_prompt_public.trim().slice(0, 4000) : "";
+    await db.update(workspaces).set({ ai_draft_prompt_dm: rawDm || null, ai_draft_prompt_public: rawPublic || null }).where(eq(workspaces.id, a.workspaceId));
+    return c.html(renderAiDraftPrompt(rawDm || null, rawPublic || null, true, license.upgradeUrl, "Default AI-draft prompt saved.", await isAiConfigured()));
+  });
+
+  // AIPROMPT1: persist the workspace-default rephrase prompt (PRO). Blank → null (built-in default).
+  // Server-side PRO gate — a forged POST from a free instance is refused (403, no write).
+  app.post("/settings/ai-rephrase-prompt", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const license = await getInstanceLicense();
+    if (!license.features.has("ai_rephrase")) {
+      return c.html(renderAiRephrasePrompt(null, false, license.upgradeUrl), 403);
+    }
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    // Cap at 4000 (parity with the AI-draft prompt + the per-rule custom_prompt 2000 is the override).
+    const raw = typeof form.ai_rephrase_prompt === "string" ? form.ai_rephrase_prompt.trim().slice(0, 4000) : "";
+    await db.update(workspaces).set({ ai_rephrase_prompt: raw || null }).where(eq(workspaces.id, a.workspaceId));
+    return c.html(renderAiRephrasePrompt(raw || null, true, license.upgradeUrl, "Default rephrase prompt saved.", await isAiConfigured()));
+  });
+
+  app.get("/settings", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.redirect("/login");
+    const [workspace, license, alertWebhook, keys] = await Promise.all([
+      db.query.workspaces.findFirst({ where: eq(workspaces.id, a.workspaceId), columns: { message_retention_days: true, ai_draft_prompt_dm: true, ai_draft_prompt_public: true, ai_rephrase_prompt: true } }),
+      getInstanceLicense(),
+      getAlertWebhook(a.workspaceId),
+      loadKeys(a.workspaceId),
+    ]);
+    const canAlerts = license.features.has("managed_connection");
+    const canAiDraft = license.features.has("ai_draft");
+    const canAiRephrase = license.features.has("ai_rephrase");
+    const canAiLogs = canAiDraft || canAiRephrase;
+    const aiConfigured = await isAiConfigured();
+    const aiGenerationLogRows = canAiLogs ? await loadAiGenerationLogs(a.workspaceId) : [];
+    const upgradeUrl = license.upgradeUrl;
+    return c.html(
+      dashboardDoc(
+        t("title.suffix", { section: "Settings" }),
+        "/settings",
+        html`<div class="page" x-data="{ tab: 'account', tabs: ['account','apikeys','license','integrations','sources','automation','data'], go(t){ this.tab = t; history.replaceState(null, '', '#' + t); } }" x-init="const h = location.hash.slice(1); if (tabs.includes(h)) tab = h;">
+          <h1>Settings</h1>
+          <p class="muted">Manage your workspace settings and integrations.</p>
+          <nav class="settings-tabs" role="tablist">
+            <button type="button" class="settings-tab" :class="{ active: tab==='account' }" @click="go('account')">Account</button>
+            <button type="button" class="settings-tab" :class="{ active: tab==='apikeys' }" @click="go('apikeys')">API keys</button>
+            <button type="button" class="settings-tab" :class="{ active: tab==='license' }" @click="go('license')">License</button>
+            <button type="button" class="settings-tab" :class="{ active: tab==='integrations' }" @click="go('integrations')">Integrations</button>
+            <button type="button" class="settings-tab" :class="{ active: tab==='sources' }" @click="go('sources')">Sources</button>
+            <button type="button" class="settings-tab" :class="{ active: tab==='automation' }" @click="go('automation')">Automation</button>
+            <button type="button" class="settings-tab" :class="{ active: tab==='data' }" @click="go('data')">Data</button>
+          </nav>
+          <div class="settings-panel" x-show="tab==='apikeys'" x-cloak>
+          <section class="section">
+            <h2>API keys ${license.features.has("api_access") ? "" : proLink(upgradeUrl, "PRO")}</h2>
+            ${apiKeysSection(keys, license)}
+          </section>
+          </div>
+          <div class="settings-panel" x-show="tab==='account'" x-cloak>
+          <section class="section">
+            <h2>Change password</h2>
+            <form hx-post="/settings/password" hx-ext="json-enc" hx-target="#password-msg" hx-swap="innerHTML" class="stack" style="max-width:24rem">
+              <div><label class="label">Current password</label><input class="input" type="password" name="current_password" autocomplete="current-password" required /></div>
+              <div><label class="label">New password (min 8 chars)</label><input class="input" type="password" name="new_password" autocomplete="new-password" minlength="8" required /></div>
+              <div class="row"><button class="btn btn-primary" type="submit">Update password</button></div>
+            </form>
+            <p id="password-msg" class="muted" style="margin-top:.5rem"></p>
+          </section>
+          </div>
+          <div class="settings-panel" x-show="tab==='data'" x-cloak>
+          <section class="section">
+            <h2>Data retention</h2>
+            <p class="muted" style="margin-bottom:1rem">Delete messages older than N days (runs daily). Blank = keep forever. Pending messages are never deleted.</p>
+            <form hx-post="/settings/retention" hx-ext="json-enc" hx-target="#retention-msg" hx-swap="innerHTML" style="display:flex;flex-direction:row;align-items:center;gap:.5rem;flex-wrap:nowrap">
+              <input class="input" style="width:7rem;flex:0 0 auto" type="number" min="1" name="message_retention_days" placeholder="Keep forever"
+                value="${workspace?.message_retention_days ?? ""}" />
+              <span class="muted" style="flex:0 0 auto">days</span>
+              <button class="btn btn-primary" type="submit" style="flex:0 0 auto">Save</button>
+            </form>
+            <p id="retention-msg" class="muted" style="margin-top:.5rem"></p>
+            <p class="muted" style="margin-top:1rem;font-size:.85rem">
+              ${env.HISTORY_RETENTION_DAYS > 0
+                ? html`Webhook events and post reactions are compacted automatically after
+                    <strong>${env.HISTORY_RETENTION_DAYS} days</strong> — rolled into aggregates (all-time
+                    counts and the Engagement view stay correct) and the raw rows are removed, so the
+                    database stays small. Configured by the operator via <code>HISTORY_RETENTION_DAYS</code>.`
+                : html`Automatic compaction of webhook events and post reactions is
+                    <strong>disabled</strong> (<code>HISTORY_RETENTION_DAYS=0</code>) — those tables grow
+                    without bound. Set a value (≥ 30 days) to keep the database small.`}
+            </p>
+          </section>
+          </div>
+          <div class="settings-panel" x-show="tab==='license'" x-cloak>
+          <section class="section">
+            <h2>License</h2>
+            <p class="muted" style="margin-bottom:1rem">Unlock PRO features with a license token from Sellf. A free instance keeps all free features.</p>
+            <form hx-post="/settings/license" hx-ext="json-enc" hx-target="#license-area" hx-swap="innerHTML" class="stack" style="margin-bottom:1rem">
+              <textarea class="input mono" name="token" rows="3" placeholder="Paste your license token" style="font-size:.8rem"></textarea>
+              <div class="row"><button class="btn btn-primary" type="submit">Verify &amp; save</button></div>
+            </form>
+            <div id="license-area">${renderLicense(license)}</div>
+          </section>
+          </div>
+          <div class="settings-panel" x-show="tab==='integrations'" x-cloak>
+          <section class="section">
+            <h2>Meta App configuration</h2>
+            <p class="muted" style="margin-bottom:.75rem">Paste these <strong>into</strong> your Facebook app at <a href="https://developers.facebook.com/apps" target="_blank" rel="noopener">developers.facebook.com/apps</a>. They are derived from <code>APP_URL</code> — no guessing.</p>
+            ${metaConfigRow("Valid OAuth Redirect URI (Facebook Login → Settings)", `${env.APP_URL}/api/oauth/facebook/callback`)}
+            ${metaConfigRow("Valid OAuth Redirect URI (Instagram)", `${env.APP_URL}/api/oauth/instagram/callback`)}
+            ${metaConfigRow("Valid OAuth Redirect URI (Instagram Business Login → API setup with Instagram login)", `${env.APP_URL}/api/oauth/instagram-login/callback`)}
+            ${metaConfigRow("Authorized redirect URI — YouTube (Google Cloud Console)", `${env.APP_URL}/api/oauth/youtube/callback`)}
+            ${metaConfigRow("Webhook callback URL (Messenger + Instagram products)", `${env.APP_URL}/api/webhooks/meta`)}
+            <h3 style="margin:1rem 0 .25rem">Other publishing platforms</h3>
+            <p class="muted" style="margin-bottom:.75rem">Direct-OAuth publishers. Paste each redirect URI into that platform's developer app.</p>
+            ${(
+              [
+                ["LinkedIn (LinkedIn Developers → Auth → Authorized redirect URLs)", "linkedin"],
+                ["X / Twitter (developer portal → User authentication settings → Callback URI)", "x"],
+                ["TikTok (developers.tiktok.com → Login Kit → Redirect URI)", "tiktok"],
+                ["Threads (developers.facebook.com → Threads app → Redirect Callback URLs)", "threads"],
+              ] as const
+            ).map(([label, id]) => metaConfigRow(label, `${env.APP_URL}/api/oauth/connect/${id}/callback`))}
+            <h3 style="margin:1rem 0 .25rem">Your credentials</h3>
+            <p class="muted" style="margin-bottom:.75rem">Paste your integration credentials here — stored encrypted; a value set here overrides the matching environment variable, so you don't have to edit <code>.env</code>. Grouped by integration below.</p>
+            ${renderCredentials(await configStatus())}
+          </section>
+          ${license.products.has("publishing") ? renderProvidersStatus() : ""}
+          </div>
+          <div class="settings-panel" x-show="tab==='sources'" x-cloak>
+          <section class="section">
+            <h2>Sources — managed connections</h2>
+            ${await renderSourcesManager(a.workspaceId)}
+          </section>
+          </div>
+          <div class="settings-panel" x-show="tab==='automation'" x-cloak>
+          <section class="section">
+            <div class="row" style="align-items:center;gap:.5rem;margin-bottom:.25rem">
+              <h2 style="margin:0">Alert webhook</h2>
+              ${canAlerts ? html`` : proLink(upgradeUrl, "PRO")}
+            </div>
+            <p class="muted" style="margin-bottom:1rem">Get a proactive POST when a connection needs re-auth or nears expiry. Add custom headers + templated fields to target email (via your own sender), Slack, or n8n. ${canAlerts ? "" : html`This is a ${proLink(upgradeUrl, "PRO")} feature.`}</p>
+            <div id="alert-webhook-area">${renderAlertWebhook(alertWebhook, canAlerts, upgradeUrl)}</div>
+          </section>
+          <section class="section">
+            <div class="row" style="align-items:center;gap:.5rem;margin-bottom:.25rem">
+              <h2 style="margin:0">AI-drafted replies</h2>
+              ${canAiDraft ? html`` : proLink(upgradeUrl, "PRO")}
+            </div>
+            <p class="muted" style="margin-bottom:1rem">Set the workspace-default prompt used when drafting AI replies. Each channel can override it (and enable drafting) from its own settings.</p>
+            <div id="ai-draft-prompt-area">${renderAiDraftPrompt(workspace?.ai_draft_prompt_dm ?? null, workspace?.ai_draft_prompt_public ?? null, canAiDraft, upgradeUrl, undefined, aiConfigured)}</div>
+          </section>
+          <section class="section">
+            <div class="row" style="align-items:center;gap:.5rem;margin-bottom:.25rem">
+              <h2 style="margin:0">AI rephrasing</h2>
+              ${canAiRephrase ? html`` : proLink(upgradeUrl, "PRO")}
+            </div>
+            <p class="muted" style="margin-bottom:1rem">Default prompt used when a rule rephrases its reply with AI (the “Rephrase with AI for variety” toggle). A rule can override it with its own Tone / Custom prompt. Blank = the built-in default shown below.</p>
+            <div id="ai-rephrase-prompt-area">${renderAiRephrasePrompt(workspace?.ai_rephrase_prompt ?? null, canAiRephrase, upgradeUrl, undefined, aiConfigured)}</div>
+          </section>
+          <section class="section">
+            <div class="row" style="align-items:center;gap:.5rem;margin-bottom:.25rem">
+              <h2 style="margin:0">AI generation log</h2>
+              ${canAiLogs ? html`` : proLink(upgradeUrl, "PRO")}
+            </div>
+            <p class="muted" style="margin-bottom:1rem">Every AI-drafted reply and rephrase, exactly as sent to and received from the model — expand a row to see the full system/user prompt and response or failure reason.</p>
+            ${renderAiGenerationLogs(aiGenerationLogRows, canAiLogs, upgradeUrl)}
+          </section>
+          </div>
+        </div>`,
+        license.features,
+        license.products,
+      ),
+    );
+  });
+
+  app.post("/settings/api-keys", guard, async (c) => {
+    // Transform the form (name + the scope checkboxes serialized to scopes_json) into the API's
+    // JSON shape, so a dashboard key can be scoped instead of always full-access.
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const scopes = parseJsonArray(typeof form.scopes_json === "string" ? form.scopes_json : "").filter((s): s is string => typeof s === "string");
+    // An empty scopes array is the full-access sentinel for programmatic keys, but in this form
+    // deselecting every permission means the user wants no permissions. Require at least one.
+    if (scopes.length === 0) {
+      const a = await auth(c);
+      if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+      return c.html(renderKeys(await loadKeys(a.workspaceId), "Select at least one permission."));
+    }
+    const res = await apiKeys.POST(jsonReq(c, { name: form.name ?? "", scopes }));
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const body = await res.json().catch(() => ({}));
+    const keys = await loadKeys(a.workspaceId);
+    const created = res.status === 201 ? body?.data?.key : null;
+    const banner = created
+      ? html`<div class="notice notice-ok"><strong>Copy this key now — it won't be shown again:</strong><br /><code class="mono">${created}</code></div>`
+      : res.status >= 400
+        ? html`<div class="notice notice-err">${body?.error?.message ?? "Failed to create key."}</div>`
+        : html``;
+    return c.html(html`${banner}${renderKeys(keys)}`);
+  });
+
+  app.delete("/settings/api-keys/:id", guard, async (c) => {
+    const id = c.req.param("id");
+    const res = await apiKey.DELETE(c.req.raw, { params: Promise.resolve({ keyId: id }) }).catch(() => null);
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const keys = await loadKeys(a.workspaceId);
+    return c.html(renderKeys(keys, await noticeFrom(res, "Could not revoke the API key.")));
+  });
+
+  app.post("/settings/password", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, string>;
+    const current = form.current_password ?? "";
+    const next = form.new_password ?? "";
+    if (next.length < 8) return c.html(html`<span class="error">New password must be at least 8 characters.</span>`);
+    const user = await db.query.users.findFirst({ where: eq(users.id, a.userId), columns: { password_hash: true } });
+    if (!user?.password_hash || !(await verifyPassword(current, user.password_hash))) {
+      return c.html(html`<span class="error">Current password is incorrect.</span>`);
+    }
+    await db.update(users).set({ password_hash: await hashPassword(next) }).where(eq(users.id, a.userId));
+    return c.html(html`<span style="color:var(--ok-text)">Password updated.</span>`);
+  });
+
+  app.post("/settings/retention", guard, async (c) => {
+    const form = await c.req.json().catch(() => ({} as Record<string, unknown>));
+    const rawDays = (form as Record<string, unknown>).message_retention_days;
+    const days = rawDays === "" || rawDays == null ? null : Number(rawDays);
+    // Validate server-side: the input's min="1" is client-only. A direct POST with 0/negative
+    // makes the prune cutoff `now` (or the future) and the next retention run deletes EVERY
+    // prunable message in the workspace. Require a whole number in a sane range.
+    if (days !== null && (!Number.isInteger(days) || days < 1 || days > MAX_RETENTION_DAYS)) {
+      return c.html(html`Retention must be a whole number of days between 1 and ${MAX_RETENTION_DAYS}.`);
+    }
+    const res = await workspacePatch(c, days);
+    return c.html(html`${res ? "Saved." : "Could not save retention policy."}`);
+  });
+
+  app.post("/settings/license", guard, async (c) => {
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const token = typeof form.token === "string" ? form.token.trim() : "";
+    if (!token) {
+      return c.html(renderLicense(await getInstanceLicense(), "Paste a license token first."));
+    }
+    const result = await setLicense(token);
+    if (!result.ok) {
+      return c.html(renderLicense(result.state, licenseRejectionMessage(result.reason)));
+    }
+    return c.html(renderLicense(result.state, "License activated.", true));
+  });
+
+  app.post("/settings/license/clear", guard, async (c) => {
+    return c.html(renderLicense(await clearLicense(), "License removed.", true));
+  });
+
+  // CONFIG1: set / clear an instance integration credential (stored encrypted; overrides the env var).
+  app.post("/settings/credentials", guard, async (c) => {
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const key = typeof form.key === "string" ? form.key : "";
+    if (!CONFIG_KEYS.has(key)) {
+      return c.html(renderCredentials(await configStatus(), "Unknown setting."));
+    }
+    let msg = "";
+    if (form.clear === "1" || form.clear === true) {
+      await clearConfig(key as Parameters<typeof clearConfig>[0]);
+      msg = "Reverted to the environment variable.";
+    } else {
+      const value = typeof form.value === "string" ? form.value.trim() : "";
+      if (!value) {
+        // Empty save = no-op (don't silently wipe a secret); use Clear to revert.
+        return c.html(renderCredentials(await configStatus(), "Nothing changed — enter a value, or use Clear to revert to env."));
+      }
+      await setConfig(key as Parameters<typeof setConfig>[0], value);
+      msg = "Saved.";
+    }
+    return c.html(renderCredentials(await configStatus(), msg));
+  });
+
+  // Rules
+  app.get("/rules", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.redirect("/login");
+    const { features, upgradeUrl, products } = await getInstanceLicense();
+    const canFollowGate = features.has("follow_gate");
+    const canInteractive = features.has("interactive_messages");
+    const canPersonalize = features.has("personalization");
+    const canReactionTrigger = features.has("reaction_trigger");
+    const canSequence = features.has("sequences");
+    const canAiRephrase = features.has("ai_rephrase");
+    const aiConfigured = await isAiConfigured();
+    const ruleChannels = await loadInboxChannels(a.workspaceId);
+    // Active sequences a rule can enroll a matched contact into (SEQTRIGGER1).
+    const activeSequences = (await loadSequences(a.workspaceId)).filter((seq) => seq.status === "active");
+    return c.html(
+      dashboardDoc(
+        t("title.suffix", { section: "Rules" }),
+        "/rules",
+        html`<div class="page">
+          <h1>Rules</h1>
+          <p class="muted">Auto-replies for DMs and comments. Leave keywords blank on a comment rule with a post to reply to every comment on that post.</p>
+          <details class="card" style="margin:1rem 0">
+            <summary style="cursor:pointer;font-weight:600">+ New rule</summary>
+            ${ruleCreateForm(
+              { canFollowGate, canInteractive, canPersonalize, canReactionTrigger, canSequence, canAiRephrase, aiConfigured, upgradeUrl },
+              ruleChannels,
+              activeSequences,
+              null,
+              false,
+            )}
+          </details>
+          <div id="rules-list">${renderRules(await loadRules(a.workspaceId))}</div>
+        </div>`,
+        features,
+        products,
+      ),
+    );
+  });
+
+  app.post("/rules", guard, async (c) => {
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, string>;
+    const keywords = (form.keywords ?? "")
+      .split(",")
+      .map((k) => k.trim())
+      .filter(Boolean)
+      .map((value) => ({ value, match_type: "contains" }));
+    const triggerType = ["comment_keyword", "postback", "reaction"].includes(form.trigger_type) ? form.trigger_type : "keyword";
+    const postId = (form.post_id ?? "").trim();
+    // The postback payload input is hidden (x-show) for other triggers but json-enc still serializes
+    // it, so a value typed under "postback" then switched away would leak in as a stale payload (and
+    // into the follow-gate claim button below). Only honour it when the trigger is actually postback.
+    const payloadValue = triggerType === "postback" ? (form.payload ?? "").trim() : "";
+    const commentReply = (form.comment_reply_text ?? "").trim();
+    const followGate = form.response_mode === "follow_gate";
+    const isSequence = form.response_mode === "sequence";
+
+    const triggerConfig: Record<string, unknown> = {};
+    if (triggerType === "postback") {
+      if (payloadValue) triggerConfig.payload = payloadValue;
+    } else if (triggerType === "reaction") {
+      // Empty config = fire on any reaction. Keywords/post_id don't apply here.
+    } else {
+      if (keywords.length) triggerConfig.keywords = keywords;
+      if (triggerType === "comment_keyword" && postId) triggerConfig.post_id = postId;
+    }
+
+    let responseType = "text";
+    const responseConfig: Record<string, unknown> = {};
+    if (isSequence) {
+      responseType = "sequence";
+      if (form.sequence_id) responseConfig.sequence_id = form.sequence_id;
+    } else if (followGate) {
+      responseType = "follow_gate";
+      const claimLabel = (form.claim_label ?? "").trim() || "Chcę odebrać";
+      const claimPayload = payloadValue || "CLAIM";
+      responseConfig.followed = { text: form.followed_text ?? "" };
+      responseConfig.not_followed = { text: form.not_followed_text ?? "", buttons: [{ title: claimLabel, payload: claimPayload }] };
+    } else {
+      responseConfig.text = form.text ?? "";
+      // AI rephrase is a flag on a text reply (not a distinct response_type). The API gates it to the
+      // ai_rephrase PRO feature and 402s if unlicensed; the UI also hides the toggle on free.
+      if (form.ai_rephrase === "true") {
+        responseConfig.ai_rephrase = true;
+        // AIPROMPT1: optional per-rule overrides (caps mirror the API: tone 100, custom_prompt 2000).
+        const tone = typeof form.tone === "string" ? form.tone.trim().slice(0, 100) : "";
+        const customPrompt = typeof form.custom_prompt === "string" ? form.custom_prompt.trim().slice(0, 2000) : "";
+        if (tone) responseConfig.tone = tone;
+        if (customPrompt) responseConfig.custom_prompt = customPrompt;
+      }
+      if (triggerType === "comment_keyword") {
+        responseConfig.reply_mode = form.reply_mode === "comment" || form.reply_mode === "both" ? form.reply_mode : "dm";
+        if (commentReply) responseConfig.comment_reply_text = commentReply;
+      }
+      const quickReplies = parseJsonArray(form.quick_replies_json);
+      if (quickReplies.length) responseConfig.quick_replies = quickReplies;
+      const buttons = parseJsonArray(form.buttons_json);
+      if (buttons.length) responseConfig.buttons = buttons;
+    }
+
+    const payload = {
+      name: form.name ?? "",
+      channel_id: form.channel_id ? form.channel_id : null,
+      trigger_type: triggerType,
+      trigger_config: triggerConfig,
+      response_type: responseType,
+      response_config: responseConfig,
+      requires_approval: form.requires_approval === "true",
+    };
+    const res = await rules.POST(jsonReq(c, payload));
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const list = renderRules(await loadRules(a.workspaceId));
+    if (res.status >= 400) {
+      const body = await res.json().catch(() => ({}));
+      return c.html(html`<div class="notice notice-err">${body?.error?.message ?? "Could not create rule."}</div>${list}`);
+    }
+    return c.html(list);
+  });
+
+  app.post("/rules/:id/toggle", guard, async (c) => {
+    const id = c.req.param("id");
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const existing = await db.query.autoReplyRules.findFirst({ where: and(eq(autoReplyRules.id, id), eq(autoReplyRules.workspace_id, a.workspaceId)), columns: { is_active: true } });
+    let res: Response | null = null;
+    if (existing) {
+      res = await rule.PATCH(jsonReqMethod(c, "PATCH", { is_active: !existing.is_active }), { params: Promise.resolve({ ruleId: id }) }).catch(() => null);
+    }
+    return c.html(renderRules(await loadRules(a.workspaceId), await noticeFrom(res, "Could not update the rule.")));
+  });
+
+  app.delete("/rules/:id", guard, async (c) => {
+    const id = c.req.param("id");
+    const res = await rule.DELETE(c.req.raw, { params: Promise.resolve({ ruleId: id }) }).catch(() => null);
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    return c.html(renderRules(await loadRules(a.workspaceId), await noticeFrom(res, "Could not delete the rule.")));
+  });
+
+  // The rules list as a partial (for Cancel out of the inline edit form).
+  app.get("/rules/list", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    return c.html(renderRules(await loadRules(a.workspaceId)));
+  });
+
+  app.get("/rules/:id/edit", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const r = await loadRuleForEdit(a.workspaceId, c.req.param("id"));
+    if (!r) return c.html(renderRules(await loadRules(a.workspaceId), "Rule not found."));
+    const { features, upgradeUrl } = await getInstanceLicense();
+    const channels = await loadInboxChannels(a.workspaceId);
+    const activeSequences = (await loadSequences(a.workspaceId)).filter((seq) => seq.status === "active");
+    return c.html(renderRuleEditForm(r, features.has("interactive_messages"), upgradeUrl, channels, activeSequences, features.has("ai_rephrase"), await isAiConfigured()));
+  });
+
+  // Duplicate = the Create form pre-filled with the source rule's settings, swapped into #rules-list.
+  // It POSTs to /rules (create), so nothing is saved until Submit and the source rule is untouched.
+  app.get("/rules/:id/duplicate", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const r = await loadRuleForEdit(a.workspaceId, c.req.param("id"));
+    if (!r) return c.html(renderRules(await loadRules(a.workspaceId), "Rule not found."));
+    const { features, upgradeUrl } = await getInstanceLicense();
+    const channels = await loadInboxChannels(a.workspaceId);
+    const activeSequences = (await loadSequences(a.workspaceId)).filter((seq) => seq.status === "active");
+    const caps: RuleCaps = {
+      canFollowGate: features.has("follow_gate"),
+      canInteractive: features.has("interactive_messages"),
+      canPersonalize: features.has("personalization"),
+      canReactionTrigger: features.has("reaction_trigger"),
+      canSequence: features.has("sequences"),
+      canAiRephrase: features.has("ai_rephrase"),
+      aiConfigured: await isAiConfigured(),
+      upgradeUrl,
+    };
+    return c.html(html`<section class="panel" style="margin-bottom:1rem">
+      <div class="panel-head"><h3>Duplicate rule</h3><span class="panel-sub">${r.trigger_type} → ${r.response_type}</span></div>
+      ${ruleCreateForm(caps, channels, activeSequences, r, true)}
+    </section>`);
+  });
+
+  app.post("/rules/:id", guard, async (c) => {
+    const id = c.req.param("id");
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, string>;
+    const existing = await loadRuleForEdit(a.workspaceId, id);
+    if (!existing) return c.html(renderRules(await loadRules(a.workspaceId), "Rule not found."));
+    // The API PATCH replaces whole config columns, so overlay the edited fields onto the existing
+    // configs — advanced response config (buttons / quick replies / follow-gate) survives untouched.
+    const triggerConfig = { ...((existing.trigger_config ?? {}) as Record<string, unknown>) };
+    if (existing.trigger_type === "keyword" || existing.trigger_type === "comment_keyword") {
+      const keywords = (form.keywords ?? "").split(",").map((k) => k.trim()).filter(Boolean).map((value) => ({ value, match_type: "contains" }));
+      if (keywords.length) triggerConfig.keywords = keywords;
+      else delete triggerConfig.keywords;
+    }
+    if (existing.trigger_type === "comment_keyword") {
+      const postId = (form.post_id ?? "").trim();
+      if (postId) triggerConfig.post_id = postId;
+      else delete triggerConfig.post_id;
+    }
+    const responseConfig = { ...((existing.response_config ?? {}) as Record<string, unknown>) };
+    if (existing.response_type === "sequence") {
+      if (form.sequence_id) responseConfig.sequence_id = form.sequence_id;
+    }
+    if (existing.response_type === "text") {
+      responseConfig.text = form.text ?? "";
+      // ai_rephrase toggle: the field is sent (Alpine-bound "true"/"false") only when the editor
+      // renders it (licensed). Absent (free instance) → leave the stored value untouched.
+      if (form.ai_rephrase !== undefined) {
+        if (form.ai_rephrase === "true") {
+          responseConfig.ai_rephrase = true;
+          // AIPROMPT1: update per-rule overrides; blank clears them (fall back to workspace/built-in).
+          const tone = typeof form.tone === "string" ? form.tone.trim().slice(0, 100) : "";
+          const customPrompt = typeof form.custom_prompt === "string" ? form.custom_prompt.trim().slice(0, 2000) : "";
+          if (tone) responseConfig.tone = tone; else delete responseConfig.tone;
+          if (customPrompt) responseConfig.custom_prompt = customPrompt; else delete responseConfig.custom_prompt;
+        } else {
+          delete responseConfig.ai_rephrase;
+          delete responseConfig.tone;
+          delete responseConfig.custom_prompt;
+        }
+      }
+      if (existing.trigger_type === "comment_keyword") {
+        responseConfig.reply_mode = form.reply_mode === "comment" || form.reply_mode === "both" ? form.reply_mode : "dm";
+        const cr = (form.comment_reply_text ?? "").trim();
+        if (cr) responseConfig.comment_reply_text = cr;
+        else delete responseConfig.comment_reply_text;
+      }
+      // Action buttons / quick replies. Only touch them when the editor was present (the json field
+      // is sent) — a free instance renders no editor, so it sends nothing and its config is preserved.
+      // Parsing is ungated here (matching the create handler); the UI gates the editor by license.
+      if (form.quick_replies_json !== undefined) {
+        const qr = parseJsonArray(form.quick_replies_json);
+        if (qr.length) responseConfig.quick_replies = qr;
+        else delete responseConfig.quick_replies;
+      }
+      if (form.buttons_json !== undefined) {
+        const btns = parseJsonArray(form.buttons_json);
+        if (btns.length) responseConfig.buttons = btns;
+        else delete responseConfig.buttons;
+      }
+    }
+    const payload = {
+      name: form.name ?? "",
+      channel_id: form.channel_id ? form.channel_id : null,
+      trigger_config: triggerConfig,
+      response_config: responseConfig,
+      requires_approval: form.requires_approval === "true",
+    };
+    const res = await rule.PATCH(jsonReqMethod(c, "PATCH", payload), { params: Promise.resolve({ ruleId: id }) }).catch(() => null);
+    const list = renderRules(await loadRules(a.workspaceId));
+    if (!res || res.status >= 400) {
+      const body = res ? await res.json().catch(() => ({})) : {};
+      return c.html(html`<div class="notice notice-err">${(body as { error?: { message?: string } })?.error?.message ?? "Could not update the rule."}</div>${list}`);
+    }
+    return c.html(list);
+  });
+
+  // Approvals (human-in-the-loop review queue)
+  app.get("/approvals", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.redirect("/login");
+    const { features, products } = await getInstanceLicense();
+    return c.html(
+      dashboardDoc(
+        t("title.suffix", { section: "Approvals" }),
+        "/approvals",
+        html`<div class="page">
+          <h1>Approvals</h1>
+          <p class="muted">Replies from rules marked “hold for approval” wait here. Approve to send, or reject to discard.</p>
+          <div id="approvals-list">${await renderApprovalsView(a.workspaceId)}</div>
+        </div>`,
+        features,
+        products,
+      ),
+    );
+  });
+
+  app.post("/approvals/:id/approve", guard, async (c) => {
+    const id = c.req.param("id");
+    const res = await approvalApprove.POST(jsonReq(c, {}), { params: Promise.resolve({ approvalId: id }) }).catch(() => null);
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    // Most impactful swallow: if the enqueue tx failed the approval stays pending and nothing was
+    // sent — the operator must see that, not a silent re-render.
+    return c.html(await renderApprovalsView(a.workspaceId, await noticeFrom(res, "Could not approve — the reply was not sent.")));
+  });
+
+  app.post("/approvals/:id/reject", guard, async (c) => {
+    const id = c.req.param("id");
+    const res = await approvalReject.POST(jsonReq(c, {}), { params: Promise.resolve({ approvalId: id }) }).catch(() => null);
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    return c.html(await renderApprovalsView(a.workspaceId, await noticeFrom(res, "Could not reject the reply.")));
+  });
+
+  // ADUX2: edit a draft's text straight from the Approvals list (previously only possible from the
+  // inbox thread). Reuses updateProposedText (DRY with /inbox/approval/:id/edit) but re-renders the
+  // approvals list, not a thread.
+  app.post("/approvals/:id/edit", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const id = c.req.param("id");
+    const existing = await db.query.pendingApprovals.findFirst({
+      where: and(eq(pendingApprovals.id, id), eq(pendingApprovals.workspace_id, a.workspaceId)),
+      columns: { proposed_content: true },
+    });
+    if (!existing) return c.notFound();
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const text = typeof form.text === "string" ? form.text.trim() : "";
+    await updateProposedText(a.workspaceId, id, existing.proposed_content, text);
+    return c.html(await renderApprovalsView(a.workspaceId));
+  });
+
+  // ADDEL1: delete a draft/approval entirely from the Approvals page — any status, so a resolved row
+  // can be purged from "Recently resolved" too (hx-confirm on the button).
+  app.delete("/approvals/:id", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const id = c.req.param("id");
+    const ok = await deletePendingApproval(a.workspaceId, id);
+    if (!ok) return c.notFound();
+    return c.html(await renderApprovalsView(a.workspaceId));
+  });
+
+  // Events — the workspace activity log (a nav target). Read-only, identity-free type/time rows.
+  app.get("/events", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.redirect("/login");
+    const { features, products } = await getInstanceLicense();
+    const rows = await db.query.events.findMany({
+      where: eq(eventsTbl.workspace_id, a.workspaceId),
+      orderBy: [desc(eventsTbl.created_at)],
+      limit: 100,
+      columns: { id: true, type: true, subject_type: true, subject_id: true, payload: true, created_at: true },
+    });
+    return c.html(
+      dashboardDoc(
+        t("title.suffix", { section: "Events" }),
+        "/events",
+        html`<div class="page">
+          <h1>Events</h1>
+          <p class="muted">A log of what happened in this workspace — channel, publishing and automation events.</p>
+          ${rows.length === 0
+            ? html`<p class="muted">No events yet. Activity shows up here as channels connect, posts publish, and tokens expire.</p>`
+            : html`<table><thead><tr><th>Event</th><th>Platform</th><th>Subject</th><th>Detail</th><th>When</th></tr></thead>
+                <tbody>${rows.map((e) => {
+                  const p = (e.payload ?? {}) as { displayName?: string; platform?: string; error?: string; reason?: string; providerHandle?: string };
+                  const meta = EVENT_META[e.type];
+                  const platform = p.platform ? PLATFORM_LABELS[p.platform] ?? p.platform : "—";
+                  const subject = p.displayName ?? (e.subject_type ? `${e.subject_type}${e.subject_id ? ` · ${e.subject_id}` : ""}` : "—");
+                  const detail = p.error ?? p.reason ?? p.providerHandle ?? "";
+                  return html`<tr>
+                    <td><span class="badge tone-${meta?.tone ?? "neutral"}">${meta?.label ?? e.type}</span></td>
+                    <td class="muted" style="font-size:.82rem">${platform}</td>
+                    <td class="muted" style="font-size:.82rem">${subject}</td>
+                    <td class="muted mono" style="font-size:.72rem;max-width:24rem;overflow-wrap:anywhere">${detail || "—"}</td>
+                    <td class="muted" style="white-space:nowrap">${timeAgo(e.created_at)}</td>
+                  </tr>`;
+                })}</tbody></table>`}
+        </div>`,
+        features,
+        products,
+      ),
+    );
+  });
+
+  // Webhooks — the inbound webhook-event log (a nav target). Shows recent Meta/Telegram deliveries and
+  // how each was handled; outbound alert-webhook config lives under Settings.
+  app.get("/webhooks", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.redirect("/login");
+    const { features, products, upgradeUrl } = await getInstanceLicense();
+    // webhook_events has no workspace_id column (it resolves page→channel); scope by the workspace's
+    // own channels so the log is tenant-correct.
+    const wsChannels = await db.query.channels.findMany({
+      where: eq(channels.workspace_id, a.workspaceId),
+      columns: { id: true, display_name: true, username: true },
+    });
+    const channelIds = wsChannels.map((ch) => ch.id);
+    // Which connected account each event belongs to (webhook_events stores only channel_id).
+    const channelLabel = new Map(wsChannels.map((ch) => [ch.id, ch.display_name ?? ch.username ?? null] as const));
+    const [rows, alertWebhook] = await Promise.all([
+      channelIds.length
+        ? db.query.webhookEvents.findMany({
+            where: inArray(webhookEvents.channel_id, channelIds),
+            orderBy: [desc(webhookEvents.received_at)],
+            limit: 100,
+            columns: { id: true, channel_id: true, platform: true, event_type: true, field: true, handling_status: true, received_at: true, error_detail: true },
+          })
+        : Promise.resolve([]),
+      getAlertWebhook(a.workspaceId),
+    ]);
+    const canAlerts = features.has("managed_connection");
+    const canInsights = features.has("webhook_insights");
+    const canOutbound = features.has("outbound_webhooks");
+    const stats = canInsights ? await loadWebhookStats(channelIds) : null;
+    const unhandledTypes = canInsights ? await loadUnhandledTypes(channelIds) : null;
+    return c.html(
+      dashboardDoc(
+        t("title.suffix", { section: "Webhooks" }),
+        "/webhooks",
+        html`<div class="page" x-data="{ tab: 'incoming', tabs: ['incoming','subscriptions','outgoing'], go(t){ this.tab = t; history.replaceState(null, '', '#' + t); } }" x-init="const h = location.hash.slice(1); if (tabs.includes(h)) tab = h;">
+          <h1>Webhooks</h1>
+          <p class="muted">Two separate things share this name: events <strong>coming in</strong> from the platforms, and an alert we send <strong>out</strong> to you.</p>
+          <nav class="settings-tabs" role="tablist">
+            <button type="button" class="settings-tab" :class="{ active: tab==='incoming' }" @click="go('incoming')">Incoming</button>
+            <button type="button" class="settings-tab" :class="{ active: tab==='subscriptions' }" @click="go('subscriptions')">Subscriptions</button>
+            <button type="button" class="settings-tab" :class="{ active: tab==='outgoing' }" @click="go('outgoing')">Outgoing alert</button>
+          </nav>
+          <div class="settings-panel" x-show="tab==='incoming'" x-cloak>
+          <h2>Incoming — from Meta / Telegram</h2>
+          <p class="muted" style="font-size:.85rem">The platforms POST here whenever someone messages, comments, or reacts. This is the log of what arrived and what the bot did with it.</p>
+          ${stats
+            ? renderWebhookStats(stats)
+            : html`<p class="muted" style="font-size:.82rem">Webhook delivery stats (totals by outcome) are a ${proLink(upgradeUrl, "PRO")} feature.</p>`}
+          <div class="card" style="margin:.75rem 0">
+            <div class="muted" style="font-size:.8rem;margin-bottom:.2rem">Your inbound webhook URL (paste into your Meta app)</div>
+            <code class="mono">${env.APP_URL}/api/webhooks/meta</code>
+          </div>
+          <details class="card" style="font-size:.82rem;margin-bottom:.75rem">
+            <summary style="cursor:pointer;font-weight:600">What do the statuses mean?</summary>
+            <dl class="wh-legend" style="margin:.5rem 0 0;display:grid;grid-template-columns:auto 1fr;gap:.35rem .75rem">
+              ${WEBHOOK_STATUS_LEGEND.map(([status, tone, desc]) => html`<dt><span class="badge tone-${tone}">${status}</span></dt><dd class="muted">${desc}</dd>`)}
+            </dl>
+          </details>
+          <div id="wh-detail"></div>
+          ${rows.length === 0
+            ? html`<p class="muted">No webhook events received yet. They appear here once your connected pages send activity.</p>`
+            : html`<table><thead><tr><th>Platform</th><th>Channel</th><th>Event</th><th>Status</th><th>Detail</th><th>When</th><th></th></tr></thead>
+                <tbody>${rows.map(
+                  (e) => html`<tr>
+                    <td>${PLATFORM_LABELS[e.platform ?? ""] ?? e.platform ?? "—"}</td>
+                    <td class="muted" style="font-size:.82rem">${channelLabel.get(e.channel_id ?? "") ?? "—"}</td>
+                    <td class="muted" style="font-size:.8rem">${e.event_type}${e.field ? ` · ${e.field}` : ""}</td>
+                    <td><span class="badge tone-${WEBHOOK_STATUS_TONE[e.handling_status] ?? "neutral"}">${e.handling_status}</span></td>
+                    <td class="muted" style="font-size:.78rem">${e.handling_status === "error" && e.error_detail ? html`<span style="color:var(--bad-text)">${e.error_detail}</span>` : e.field ? e.field : "—"}</td>
+                    <td class="muted">${timeAgo(e.received_at)}</td>
+                    <td><button class="btn btn-sm" hx-get="/webhooks/${e.id}" hx-target="#wh-detail" hx-swap="innerHTML" title="Full payload + what it triggered">View</button></td>
+                  </tr>`,
+                )}</tbody></table>`}
+          ${unhandledTypes
+            ? html`<h3 style="margin-top:1.5rem">Unhandled event types</h3>
+              <p class="muted" style="font-size:.85rem">Event types that arrived and were logged (with their raw payload) but have no handler yet — so you can spot something the platforms send that the app isn't acting on. Includes instance-wide hits with no channel.</p>
+              ${renderUnhandledTypes(unhandledTypes)}`
+            : ""}
+          <h3 style="margin-top:1.5rem">Endpoint activity — handshakes &amp; rejected hits</h3>
+          <p class="muted" style="font-size:.85rem">Every hit on your webhook URL that never became an event: the Meta subscription handshake, plus requests refused before processing (bad signature, unparseable body, unknown object, oversized). Instance-wide — these carry no channel or message content.</p>
+          <div id="wh-endpoint" hx-get="/webhooks/endpoint-activity" hx-trigger="load" hx-swap="innerHTML transition:false">
+            <p class="muted" style="font-size:.82rem">Loading endpoint activity…</p>
+          </div>
+          </div>
+          <div class="settings-panel" x-show="tab==='subscriptions'" x-cloak>
+          <h2>Subscriptions — what each connected account is set to receive</h2>
+          <p class="muted" style="font-size:.85rem">PostStack auto-configures these on connect &amp; on every health check. This shows, per account, which webhook fields are <strong>active</strong> vs <strong>missing</strong> — and lets you re-apply the full set in one click.</p>
+          <div id="wh-subs" hx-get="/webhooks/subscriptions" hx-trigger="load" hx-swap="innerHTML transition:false">
+            <p class="muted" style="font-size:.82rem">Checking subscriptions…</p>
+          </div>
+          </div>
+          <div class="settings-panel" x-show="tab==='outgoing'" x-cloak>
+          <h2>Outgoing — alert webhook ${canAlerts ? "" : proLink(upgradeUrl, "PRO")}</h2>
+          <p class="muted" style="font-size:.85rem">A proactive POST we send to <em>your</em> endpoint (Slack, n8n, email relay…) when a connection needs re-auth or nears expiry — so you find out before publishing breaks.</p>
+          ${!canAlerts
+            ? html`<div class="card"><p class="muted" style="font-size:.85rem">Configuring an outbound alert webhook is a ${proLink(upgradeUrl, "PRO")} feature.</p></div>`
+            : alertWebhook
+              ? html`<div class="card">
+                  <div class="row" style="align-items:center;gap:.5rem">
+                    <span class="badge tone-${alertWebhook.enabled ? "ok" : "neutral"}">${alertWebhook.enabled ? "Enabled" : "Disabled"}</span>
+                    <code class="mono grow" style="overflow-x:auto;white-space:nowrap">${alertWebhook.url}</code>
+                  </div>
+                  <p class="muted" style="font-size:.78rem;margin-top:.4rem">
+                    ${Object.keys(alertWebhook.headers).length ? `${Object.keys(alertWebhook.headers).length} custom header(s) · ` : ""}${Object.keys(alertWebhook.extraFields).length ? `${Object.keys(alertWebhook.extraFields).length} extra field(s) · ` : ""}<a href="/settings#alert">Edit in Settings →</a>
+                  </p>
+                </div>`
+              : html`<div class="card"><p class="muted" style="font-size:.85rem">Not configured yet. <a href="/settings#alert">Set it up in Settings →</a></p></div>`}
+          <h3 style="margin-top:1.5rem">Outbound webhook endpoints ${canOutbound ? "" : proLink(upgradeUrl, "PRO")}</h3>
+          <p class="muted" style="font-size:.85rem">Subscribe one or more external URLs (n8n, Zapier, your own service) to events like <code>post.published</code> or <code>contact.created</code>. Each delivery is HMAC-signed with a per-endpoint secret. The same endpoints are manageable via <a href="/api/docs">the API</a>.</p>
+          ${outboundWebhooksMount()}
+          </div>
+        </div>`,
+        features,
+        products,
+      ),
+    );
+  });
+
+  // Clear the inbound-event detail panel (Close button).
+  app.get("/webhooks/clear", guard, (c) => c.html(html``));
+
+  // OBS1: read-only endpoint-activity list (handshakes + rejected-before-record hits), with an
+  // optional ?status= filter. Lazy-loaded + re-fetched on filter change. Registered BEFORE
+  // /webhooks/:id so this static path isn't captured by the :id param.
+  app.get("/webhooks/endpoint-activity", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const status = c.req.query("status") || undefined;
+    const rows = await loadEndpointActivity(status);
+    return c.html(renderEndpointActivity(rows, status));
+  });
+
+  // WEBHOOKSUB1: per-account subscription status panel (lazy-loaded — does live Graph reads).
+  // Registered BEFORE /webhooks/:id so the static path isn't captured by the :id param.
+  app.get("/webhooks/subscriptions", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const statuses = await loadSubscriptionStatuses(a.workspaceId);
+    return c.html(renderSubscriptionPanel(statuses));
+  });
+
+  // Re-apply the canonical subscription for one channel (the Fix / Re-apply button), then re-render
+  // the whole panel so every row reflects the new state.
+  app.post("/webhooks/subscriptions/:id/fix", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const id = c.req.param("id");
+    if (!id || !/^[0-9a-f-]{36}$/i.test(id)) return c.text("not found", 404);
+    await reconcileChannelSubscription(a.workspaceId, id).catch(() => {});
+    const statuses = await loadSubscriptionStatuses(a.workspaceId);
+    return c.html(renderSubscriptionPanel(statuses));
+  });
+
+  // Full detail for one inbound webhook event — raw payload + what it triggered. Tenant-scoped: the
+  // event must belong to one of this workspace's channels (webhook_events has no workspace_id).
+  app.get("/webhooks/:id", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const ev = await db.query.webhookEvents.findFirst({ where: eq(webhookEvents.id, c.req.param("id")) });
+    if (!ev || !ev.channel_id) return c.html(html`<div class="notice notice-err">Event not found.</div>`);
+    const owns = await db.query.channels.findFirst({
+      where: and(eq(channels.id, ev.channel_id), eq(channels.workspace_id, a.workspaceId)),
+      columns: { id: true },
+    });
+    if (!owns) return c.html(html`<div class="notice notice-err">Event not found.</div>`);
+    return c.html(renderWebhookDetail(ev));
+  });
+
+  // API keys — its own top-level page (create + revoke + scopes). Settings links here.
+  // API keys live in Settings → API keys now; redirect the old path so deep links still work.
+  app.get("/api-keys", guard, (c) => c.redirect("/settings#apikeys"));
+
+  // Sequences
+  app.get("/sequences", guard, async (c) => {
+    const a = await auth(c);
+    if (!a) return c.redirect("/login");
+    const { features, upgradeUrl, products } = await getInstanceLicense();
+    // Building drip sequences is PRO — lock the whole page (consistent with inbox/contacts), not just
+    // the builder form, so a free instance sees a clear upsell rather than an empty builder.
+    if (!features.has("sequences")) {
+      return c.html(
+        dashboardDoc(t("title.suffix", { section: "Sequences" }), "/sequences", proLockMain("Sequences", html`Automated drip message sequences are a PRO feature.`, upgradeUrl), features, products),
+      );
+    }
+    return c.html(
+      dashboardDoc(
+        t("title.suffix", { section: "Sequences" }),
+        "/sequences",
+        html`<div class="page">
+          <h1>Sequences</h1>
+          <p class="muted">Automated drip message sequences. Each line below becomes a message step.</p>
+          ${html`<details class="card" style="margin:1rem 0">
+            <summary style="cursor:pointer;font-weight:600">+ New sequence</summary>
+            <form hx-post="/sequences" hx-ext="json-enc" hx-target="#sequences-list" hx-swap="innerHTML" class="stack" style="margin-top:.75rem"
+              x-data="{
+                steps: [{ type: 'message', content: '', delay_minutes: 60 }],
+                stepsJson() {
+                  return JSON.stringify(this.steps
+                    .filter(s => s.type === 'delay' ? Number(s.delay_minutes) > 0 : (s.content && s.content.trim()))
+                    .map(s => s.type === 'delay'
+                      ? { type: 'delay', delay_minutes: Number(s.delay_minutes) }
+                      : { type: 'message', content: s.content.trim() }));
+                }
+              }">
+              <div><label class="label">Name</label><input class="input" name="name" required /></div>
+              <div><label class="label">Description</label><input class="input" name="description" /></div>
+              <div><label class="label">Steps</label>
+                <template x-for="(s, i) in steps" :key="i">
+                  <div class="row" style="margin-bottom:.4rem">
+                    <select class="input" x-model="s.type" style="max-width:160px">
+                      <option value="message">Message</option>
+                      <option value="delay">Delay (minutes)</option>
+                    </select>
+                    <input class="input" placeholder="Message text" x-model="s.content" x-show="s.type === 'message'" />
+                    <input class="input" type="number" min="1" max="20160" placeholder="Minutes" x-model="s.delay_minutes" x-show="s.type === 'delay'" style="max-width:140px" />
+                    <button class="btn btn-sm btn-danger" type="button" @click="steps.splice(i, 1)" x-show="steps.length > 1">×</button>
+                  </div>
+                </template>
+                <button class="btn btn-sm" type="button" @click="steps.push({ type: 'message', content: '', delay_minutes: 60 })" x-show="steps.length < 50">+ step</button>
+              </div>
+              <input type="hidden" name="steps_json" :value="stepsJson()" />
+              <button class="btn btn-primary" type="submit" style="align-self:flex-start">Create sequence</button>
+            </form>
+          </details>`}
+          <div id="sequences-list">${renderSequences(await loadSequences(a.workspaceId))}</div>
+        </div>`,
+        features,
+        products,
+      ),
+    );
+  });
+
+  app.post("/sequences", guard, async (c) => {
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, string>;
+    // The builder serializes typed steps (message OR delay) to steps_json; fall back to the legacy
+    // one-line-per-message textarea if JS is off. The API validates delay_minutes etc.
+    type SeqStep = { type: "message"; content: string } | { type: "delay"; delay_minutes: number };
+    const fromJson = parseJsonArray(form.steps_json)
+      .map((raw): SeqStep | null => {
+        const o = raw as Record<string, unknown>;
+        if (o.type === "delay") return { type: "delay", delay_minutes: Number(o.delay_minutes) };
+        if (typeof o.content === "string" && o.content.trim()) return { type: "message", content: o.content.trim() };
+        return null;
+      })
+      .filter((s): s is SeqStep => s !== null);
+    const steps = fromJson.length
+      ? fromJson
+      : (form.steps ?? "").split("\n").map((s) => s.trim()).filter(Boolean).map((content) => ({ type: "message", content }));
+    const payload = { name: form.name ?? "", description: form.description || undefined, steps };
+    const res = await sequences.POST(jsonReq(c, payload));
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    const list = renderSequences(await loadSequences(a.workspaceId));
+    if (res.status >= 400) {
+      const body = await res.json().catch(() => ({}));
+      return c.html(html`<div class="notice notice-err">${body?.error?.message ?? "Could not create sequence."}</div>${list}`);
+    }
+    return c.html(list);
+  });
+
+  app.post("/sequences/:id/status", guard, async (c) => {
+    const id = c.req.param("id");
+    const form = (await c.req.json().catch(() => ({}))) as Record<string, string>;
+    const res = await sequence
+      .PATCH(jsonReqMethod(c, "PATCH", { status: form.status }), { params: Promise.resolve({ sequenceId: id }) })
+      .catch(() => null);
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    // Surface a failed status change instead of silently re-rendering the unchanged list.
+    const error = !res || res.status >= 400 ? "Could not update the sequence status." : undefined;
+    return c.html(renderSequences(await loadSequences(a.workspaceId), error));
+  });
+
+  app.delete("/sequences/:id", guard, async (c) => {
+    const id = c.req.param("id");
+    const res = await sequence.DELETE(c.req.raw, { params: Promise.resolve({ sequenceId: id }) }).catch(() => null);
+    const a = await auth(c);
+    if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
+    return c.html(renderSequences(await loadSequences(a.workspaceId), await noticeFrom(res, "Could not delete the sequence.")));
+  });
+
+  // Unified publishing sections (UNIFY1 Phase 3) — mounted on the same origin+session guard.
+  registerChannels(app, guard);
+  registerCompose(app, guard);
+  registerContent(app, guard);
+  registerBrands(app, guard);
+  registerSources(app, guard);
+  registerQueue(app, guard);
+}
+
+// jsonReqMethod allows non-POST verbs for delegated handlers (PATCH).
+function jsonReqMethod(c: Context, method: string, body: unknown): Request {
+  const headers = new Headers({ "content-type": "application/json" });
+  const cookie = c.req.header("cookie");
+  if (cookie) headers.set("cookie", cookie);
+  const authz = c.req.header("authorization");
+  if (authz) headers.set("authorization", authz);
+  return new Request(c.req.url, { method, headers, body: JSON.stringify(body) });
+}
+
+async function workspacePatch(c: Context, days: number | null): Promise<boolean> {
+  const a = await auth(c);
+  if (!a) return false;
+  try {
+    await db.update(workspaces).set({ message_retention_days: days }).where(eq(workspaces.id, a.workspaceId));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// ─── contacts/keys/rules/sequences renderers ──────────────────────────────────
+
+function loadContacts(workspaceId: string, q: string, limit = 50, channelId = "all", platform = "all", brand = "all") {
+  const safeQ = q ? q.replace(/[%_\\]/g, "\\$&") : "";
+  const conds: SQL[] = [eq(contacts.workspace_id, workspaceId)];
+  if (safeQ) {
+    const pat = `%${safeQ}%`;
+    conds.push(
+      or(
+        ilike(contacts.display_name, pat),
+        ilike(contacts.email, pat),
+        exists(
+          db
+            .select({ x: sql`1` })
+            .from(contactChannels)
+            .where(
+              and(
+                eq(contactChannels.contact_id, contacts.id),
+                or(ilike(contactChannels.platform_username, pat), like(contactChannels.platform_sender_id, pat)),
+              ),
+            ),
+        ),
+      )!,
+    );
+  }
+  // Filter by the channel / platform a contact is linked to (via contact_channels). Auto-assignment
+  // only — a contact is discovered per channel; this is display + filtering, not a manual move.
+  if (channelId !== "all") {
+    conds.push(
+      exists(db.select({ x: sql`1` }).from(contactChannels).where(and(eq(contactChannels.contact_id, contacts.id), eq(contactChannels.channel_id, channelId)))),
+    );
+  } else if (platform !== "all") {
+    conds.push(
+      exists(
+        db
+          .select({ x: sql`1` })
+          .from(contactChannels)
+          .innerJoin(channels, eq(channels.id, contactChannels.channel_id))
+          .where(and(eq(contactChannels.contact_id, contacts.id), eq(channels.platform, platform as (typeof channels.platform.enumValues)[number]))),
+      ),
+    );
+  }
+  // Filter by the brand owning a contact's channel(s). Independent of channel/platform filters.
+  if (brand !== "all") {
+    conds.push(
+      exists(
+        db
+          .select({ x: sql`1` })
+          .from(contactChannels)
+          .innerJoin(channels, eq(channels.id, contactChannels.channel_id))
+          .where(and(eq(contactChannels.contact_id, contacts.id), eq(channels.brand_key, brand))),
+      ),
+    );
+  }
+  return db.query.contacts.findMany({
+    where: and(...conds),
+    orderBy: desc(contacts.last_interaction_at),
+    limit,
+    columns: { id: true, display_name: true, email: true, is_subscribed: true, last_interaction_at: true },
+    with: {
+      contact_channels: {
+        columns: { platform_sender_id: true, platform_username: true },
+        limit: 3,
+        with: { channel: { columns: { platform: true, display_name: true } } },
+      },
+    },
+  });
+}
+
+function renderContacts(contacts: Awaited<ReturnType<typeof loadContacts>>, q = "", limit = 50, channelId = "all", platform = "all", brand = "all"): Html {
+  if (contacts.length === 0) {
+    const filtered = q || channelId !== "all" || platform !== "all" || brand !== "all";
+    return html`<div class="empty">
+      <span class="empty-ic">${icon("events", "ico", 20)}</span>
+      <p class="empty-title">${filtered ? "No matching contacts" : "No contacts yet"}</p>
+      <p class="empty-body">${filtered ? "No contacts match your filters — try clearing them." : "Connect a channel and start receiving messages — everyone who writes in shows up here."}</p>
+    </div>`;
+  }
+  // A full page likely has more — offer to load the next batch by re-rendering with a larger limit
+  // (the list was previously capped at 50 with no way to browse the rest). Carry the active filters.
+  const more = contacts.length >= limit
+    ? html`<div style="margin-top:12px"><button class="btn btn-sm" hx-get="/contacts/list?q=${encodeURIComponent(q)}&channel=${encodeURIComponent(channelId)}&platform=${encodeURIComponent(platform)}&brand=${encodeURIComponent(brand)}&limit=${limit + 50}" hx-target="#contacts-list" hx-swap="innerHTML">Load more</button></div>`
+    : html``;
+  return html`<div class="table-wrap"><table>
+    <thead><tr><th>Contact</th><th>Channels</th><th>Last seen</th><th class="th-act"></th></tr></thead>
+    <tbody>
+    ${contacts.map(
+      (ct) => html`<tr>
+        <td>
+          <span style="font-weight:600;color:var(--text-1)">${ct.display_name ?? ct.contact_channels[0]?.platform_username ?? ct.contact_channels[0]?.platform_sender_id ?? "Unknown"}</span>
+          ${ct.email ? html`<div><small>${ct.email}</small></div>` : html``}
+          ${!ct.is_subscribed ? html`<div style="margin-top:3px"><span class="badge tone-bad">Unsubscribed</span></div>` : html``}
+        </td>
+        <td><span class="pill-row">${ct.contact_channels.map((cc) => html`<span class="badge" title="${cc.channel.display_name ?? cc.channel.platform}">${PLATFORM_LABELS[cc.channel.platform] ?? cc.channel.platform}${cc.platform_username ? html` · @${cc.platform_username}` : ""}</span>`)}</span></td>
+        <td><span class="muted-mono">${timeAgo(ct.last_interaction_at)}</span></td>
+        <td class="th-act"><a class="btn btn-sm" href="/inbox?contact=${ct.id}">View →</a></td>
+      </tr>`,
+    )}
+    </tbody></table></div>${more}`;
+}
+
+function loadKeys(workspaceId: string) {
+  return db.query.apiKeys.findMany({
+    where: eq(apiKeysTbl.workspace_id, workspaceId),
+    orderBy: desc(apiKeysTbl.created_at),
+    columns: { id: true, name: true, key_prefix: true, scopes: true, last_used_at: true, expires_at: true },
+  });
+}
+
+function renderKeys(keys: Array<{ id: string; name: string; key_prefix: string; scopes: string[] | null; last_used_at: Date | null; expires_at: Date | null }>, error?: string): Html {
+  const notice = error ? html`<div class="notice notice-err">${error}</div>` : html``;
+  if (keys.length === 0) return html`${notice}<p class="muted">No API keys yet.</p>`;
+  return html`${notice}<table><thead><tr><th>Name</th><th>Last used</th><th>Expiry</th><th></th></tr></thead><tbody>
+    ${keys.map(
+      (k) => html`<tr>
+        <td>${k.name}<div class="muted mono" style="font-size:.75rem">${k.key_prefix}...</div><div class="muted" style="font-size:.75rem">${k.scopes?.length ? k.scopes.join(", ") : "Full access"}</div></td>
+        <td class="muted">${k.last_used_at ? new Date(k.last_used_at).toLocaleDateString() : "Never"}</td>
+        <td class="muted">${k.expires_at ? new Date(k.expires_at).toLocaleDateString() : "No expiry"}</td>
+        <td><button class="btn btn-sm btn-danger" hx-delete="/settings/api-keys/${k.id}" hx-target="#keys-area" hx-swap="innerHTML" hx-confirm="Revoke this API key?">Revoke</button></td>
+      </tr>`,
+    )}
+  </tbody></table>`;
+}
+
+/** API-key management body (create form + key list). Lives on its own /api-keys page; the page
+ *  supplies the H1, so this renders only the intro + form + list. */
+function apiKeysSection(keys: Awaited<ReturnType<typeof loadKeys>>, license: Awaited<ReturnType<typeof getInstanceLicense>>): Html {
+  const canApi = license.features.has("api_access");
+  // Owner directive: unlicensed instances don't see the keys UI at all — only the upsell, so it's
+  // obvious that API/agent access needs PRO (mirrors the onboarding wizard's License→API step).
+  if (!canApi) return apiKeysUpsell(license.upgradeUrl);
+  const pickerState = JSON.stringify({
+    allScopes: API_SCOPES,
+    presets: Object.fromEntries(API_SCOPE_PRESETS.map(({ id, scopes }) => [id, scopes])),
+    scopes: [],
+  });
+  return html`
+    <p class="muted" style="margin-bottom:1rem">Programmatic access to your workspace over the REST API (<a href="/api/docs" target="_blank" rel="noopener">docs</a>). Authenticate with <code>Authorization: Bearer ${BRAND.idPrefix}…</code>. Keys are shown once on creation — store them securely.</p>
+    <form data-api-key-form hx-post="/settings/api-keys" hx-ext="json-enc" hx-target="#keys-area" hx-swap="innerHTML" class="stack api-key-form"
+      x-data="${pickerState}">
+      <label class="label" for="api-key-name">Key name</label>
+      <input class="input" id="api-key-name" name="name" placeholder="e.g. Content pipeline" required />
+      <div class="api-scope-picker">
+        <div class="api-scope-toolbar">
+          <div>
+            <strong>Quick presets</strong>
+            <div class="muted">A preset replaces the current selection; refine it below if needed.</div>
+          </div>
+          <div class="api-scope-actions">
+            ${API_SCOPE_PRESETS.map(
+              (preset) => html`<button class="btn btn-sm" type="button" title="${preset.description}"
+                @click="scopes = [...presets['${preset.id}']]">${preset.label}</button>`,
+            )}
+            <button class="btn btn-sm" type="button" @click="scopes = [...allScopes]">Select all</button>
+            <button class="btn btn-sm" type="button" @click="scopes = []">Deselect all</button>
+          </div>
+        </div>
+        <div class="api-scope-groups">
+          ${API_SCOPE_GROUPS.map((group) => {
+            const definitions = API_SCOPE_DEFINITIONS.filter(({ group: groupId }) => groupId === group.id);
+            return html`<fieldset class="api-scope-group">
+              <legend>${group.label}</legend>
+              <p>${group.description}</p>
+              <div class="api-scope-options">
+                ${definitions.map(
+                  (definition) => html`<label class="api-scope-option">
+                    <input data-api-scope type="checkbox" value="${definition.scope}" x-model="scopes" />
+                    <span><strong>${definition.label}</strong><code>${definition.scope}</code></span>
+                  </label>`,
+                )}
+              </div>
+            </fieldset>`;
+          })}
+        </div>
+      </div>
+      <input type="hidden" name="scopes_json" :value="JSON.stringify(scopes)" />
+      <div class="api-scope-submit">
+        <span class="muted" aria-live="polite" x-text="scopes.length + ' of ' + allScopes.length + ' permissions selected'"></span>
+        <button class="btn btn-primary" type="submit" :disabled="scopes.length === 0">Create API key</button>
+      </div>
+    </form>
+    <div id="keys-area">${renderKeys(keys)}</div>`;
+}
+
+/** License gate for the API-keys tab. Shown instead of the keys UI on the free plan: states plainly
+ *  what PRO unlocks, a buy CTA, and that free still works (license can be added later). */
+function apiKeysUpsell(upgradeUrl: string): Html {
+  const locked = [
+    "REST API access — programmatic keys for agents & integrations",
+    "First-comment automation",
+    "Auto-Story publishing",
+    "Drip sequences",
+    "Contacts CRM",
+    "Manual inbox replies",
+  ];
+  return html`<div class="upsell">
+    <div class="upsell-head">${icon("lock", "ico", 18)}<h3>API access is a PRO feature</h3></div>
+    <p class="upsell-lead">API keys and agent automations are part of PRO. On the free plan you create and schedule posts manually in the panel — without programmatic access.</p>
+    <div class="upsell-sub">Without a license, these stay off:</div>
+    <ul class="upsell-list">
+      ${locked.map((f) => html`<li>${icon("lock", "ico", 14)}<span>${f}</span></li>`)}
+    </ul>
+    <div class="upsell-actions">
+      <a class="btn btn-primary" href="${upgradeUrl}" target="_blank" rel="noopener">${icon("sparkles", "ico", 15)} Get PRO</a>
+      <a class="btn btn-ghost" href="${upgradeUrl}" target="_blank" rel="noopener">See plans</a>
+    </div>
+    <div class="callout">${icon("info", "ico", 15)}<div>Free still works — create &amp; schedule posts manually. Already have a license? Add it in the <strong>License</strong> tab and API access unlocks instantly.</div></div>
+  </div>`;
+}
+
+/** CONFIG1: editable instance-credential rows (App ID/Secret/Verify token). A DB value overrides the
+ *  env var. Secrets are never echoed — only a masked "set" preview. Each row has a Save (set/change)
+ *  and, when DB-set, a Clear (revert to env) form, both swapping this block in place via htmx. */
+function renderCredentials(status: ConfigStatus[], msg?: string): Html {
+  const badge = (s: ConfigStatus["source"]) =>
+    s === "db" ? html`<span class="badge tone-ok">set here</span>`
+    : s === "env" ? html`<span class="badge tone-info">from env</span>`
+    : html`<span class="badge tone-neutral">not set</span>`;
+  // Group rows by their integration group (preserving first-seen order) so e.g. Google / AI /
+  // Integrations / Security each get their own subheading and don't read as part of Meta.
+  const groups: string[] = [];
+  for (const f of status) if (!groups.includes(f.group)) groups.push(f.group);
+  const row = (f: ConfigStatus) => html`<div class="cred-row">
+      <div class="cred-head"><span class="cred-label">${f.label}</span>${badge(f.source)}</div>
+      <div class="cred-meta"><code>${f.key}</code>${f.preview ? html` · ${f.preview}` : ""}</div>
+      ${f.help ? html`<div class="cred-help">${f.help}</div>` : ""}
+      <div class="cred-form">
+        <form hx-post="/settings/credentials" hx-ext="json-enc" hx-target="#credentials" hx-swap="outerHTML">
+          <input type="hidden" name="key" value="${f.key}" />
+          <input class="input input-sm" type="${f.secret ? "password" : "text"}" name="value" autocomplete="off"
+            placeholder="${f.secret ? "paste to set / change" : "value"}" />
+          <button class="btn btn-sm btn-primary" type="submit">Save</button>
+        </form>
+        ${f.source === "db"
+          ? html`<form hx-post="/settings/credentials" hx-ext="json-enc" hx-target="#credentials" hx-swap="outerHTML">
+              <input type="hidden" name="key" value="${f.key}" /><input type="hidden" name="clear" value="1" />
+              <button class="btn btn-sm btn-danger" type="submit" title="Revert to the environment variable">Clear</button>
+            </form>`
+          : html``}
+      </div>
+    </div>`;
+  return html`<div id="credentials">
+    ${msg ? html`<div class="notice notice-ok" style="margin-bottom:.5rem">${msg}</div>` : html``}
+    ${groups.map((g) => html`<div class="cred-subhead">${g}</div>
+      <div class="cred-list">${status.filter((f) => f.group === g).map(row)}</div>`)}
+  </div>`;
+}
+
+// A small "🔒 PRO" link to the upgrade URL, for locking gated controls in forms.
+// A labelled, copy-to-clipboard config value (for the Meta App configuration panel).
+function metaConfigRow(label: string, value: string): Html {
+  return html`<div style="margin-bottom:.75rem">
+    <div class="muted" style="font-size:.75rem;margin-bottom:.2rem">${label}</div>
+    <div class="row" style="gap:.5rem;align-items:stretch" x-data="{ copied: false }">
+      <code class="card mono grow" style="overflow-x:auto;white-space:nowrap;padding:.5rem .6rem">${value}</code>
+      <button type="button" class="btn btn-sm" @click="navigator.clipboard.writeText($el.previousElementSibling.textContent); copied = true; setTimeout(() => copied = false, 1200)" x-text="copied ? '✓ Copied' : 'Copy'"></button>
+    </div>
+  </div>`;
+}
+
+
+// Full-page upsell shown when a free instance opens a PRO-only view (inbox / contacts).
+// Free keeps unlimited message handling; seeing individual people is the paid CRM layer.
+function proLockMain(title: string, body: Html, upgradeUrl: string): Html {
+  return html`<div class="page">
+    <h1>${title} <span class="badge">PRO</span></h1>
+    <div class="card" style="max-width:38rem">
+      <p>${body}</p>
+      <p class="muted" style="font-size:.85rem">Your automations keep running on the free plan — the bot answers everyone, with unlimited messages and contacts. The inbox and contacts CRM, where you see and manage individual people, are part of PRO.</p>
+      <a class="btn btn-primary" href="${upgradeUrl}" target="_blank" rel="noopener">Upgrade to PRO</a>
+      <a class="btn" href="/overview">Back to overview</a>
+    </div>
+  </div>`;
+}
+
+const REACTION_EMOJI: Record<string, string> = {
+  like: "👍", love: "❤️", care: "🥰", haha: "😆", wow: "😮", sad: "😢", angry: "😠",
+};
+
+type EngagementPost = { postId: string; channelName: string | null; total: number; lastAt: Date; byType: Array<{ type: string; n: number }>; reactors: string[] };
+
+/** Number of top posts (by reaction count) the Engagement table shows. */
+const ENGAGEMENT_POST_LIMIT = 200;
+
+/**
+ * Group post reactions by post → accurate per-type counts + a few reactor names, optionally scoped to
+ * a set of channels. Aggregated in SQL (`GROUP BY post_id, channel_id, reaction_type`) so the totals
+ * reflect EVERY reaction — the old "fetch latest 1000 raw rows, then group" undercounted any post with
+ * heavy engagement (e.g. 10k reactions across a few posts showed as ≤1000). `channelIds === null` =
+ * all channels; `[]` = filtered to nothing.
+ */
+// STATSCACHE1: same short-lived memo for the engagement view (a grouped scan over post_reactions).
+// Key includes the workspace and the channel scope ("all" when unfiltered).
+const engagementCache = createTtlCache<EngagementPost[]>({ ttlMs: env.STATS_CACHE_TTL_MS });
+
+export async function loadEngagement(workspaceId: string, channelIds: string[] | null): Promise<EngagementPost[]> {
+  if (channelIds && channelIds.length === 0) return [];
+  const key = `${workspaceId}|${channelIds ? channelKey(channelIds) : "all"}`;
+  return engagementCache.getOrCompute(key, () => computeEngagement(workspaceId, channelIds));
+}
+
+async function computeEngagement(workspaceId: string, channelIds: string[] | null): Promise<EngagementPost[]> {
+  const where = and(
+    eq(postReactions.workspace_id, workspaceId),
+    channelIds ? inArray(postReactions.channel_id, channelIds) : undefined,
+  );
+
+  const agg = await db
+    .select({
+      postId: postReactions.post_id,
+      channelId: postReactions.channel_id,
+      type: postReactions.reaction_type,
+      n: sql<number>`count(*)::int`,
+      lastAt: sql<Date>`max(${postReactions.created_at})`,
+    })
+    .from(postReactions)
+    .where(where)
+    .groupBy(postReactions.post_id, postReactions.channel_id, postReactions.reaction_type);
+
+  // Reactions older than the retention window live as aggregates in post_reaction_stats; merge so
+  // a fully-compacted post still shows accurate all-time totals (reactor identity is not retained).
+  const statRows = await db
+    .select({
+      post_id: postReactionStats.post_id, channel_id: postReactionStats.channel_id,
+      reaction_type: postReactionStats.reaction_type, count: postReactionStats.count,
+      last_reacted_at: postReactionStats.last_reacted_at,
+    })
+    .from(postReactionStats)
+    .where(and(eq(postReactionStats.workspace_id, workspaceId),
+      channelIds ? inArray(postReactionStats.channel_id, channelIds) : undefined));
+
+  // A small sample of reactor names per post (distinct), for the "Who" column.
+  const reactorRows = await db
+    .selectDistinct({ postId: postReactions.post_id, name: postReactions.reactor_name })
+    .from(postReactions)
+    .where(and(where, isNotNull(postReactions.reactor_name)));
+  const reactorsByPost = new Map<string, string[]>();
+  for (const r of reactorRows) {
+    if (!r.name) continue;
+    const arr = reactorsByPost.get(r.postId) ?? [];
+    if (arr.length < 8) arr.push(r.name);
+    reactorsByPost.set(r.postId, arr);
+  }
+
+  const byPost = mergePostReactionTotals(
+    agg.map((r) => ({ postId: r.postId, channelId: r.channelId, type: r.type, n: Number(r.n), lastAt: r.lastAt })),
+    statRows,
+  );
+
+  // Resolve the owning channel name from channel_id (every post_reaction carries it).
+  const chans = await db.query.channels.findMany({
+    where: eq(channels.workspace_id, workspaceId),
+    columns: { id: true, display_name: true, username: true },
+  });
+  const chanName = new Map(chans.map((ch) => [ch.id, ch.display_name ?? ch.username ?? null] as const));
+
+  return [...byPost.entries()]
+    .map(([postId, p]) => ({
+      postId,
+      channelName: chanName.get(p.channelId) ?? null,
+      total: p.total,
+      lastAt: p.lastAt,
+      byType: [...p.types.entries()].map(([type, n]) => ({ type, n })).sort((a, b) => b.n - a.n),
+      reactors: reactorsByPost.get(postId) ?? [],
+    }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, ENGAGEMENT_POST_LIMIT);
+}
+
+type DmReaction = { who: string; platform: string; emoji: string; type: string; at: Date };
+
+/** Reactions left on OUR direct messages (the only reaction signal Instagram delivers over webhooks;
+ *  Facebook DMs too). Joined to the contact for a display name and the channel for the platform. */
+async function loadMessageReactions(workspaceId: string, channelIds: string[] | null): Promise<DmReaction[]> {
+  if (channelIds && channelIds.length === 0) return [];
+  const rows = await db
+    .select({
+      type: messageReactions.reaction_type,
+      emoji: messageReactions.emoji,
+      created_at: messageReactions.created_at,
+      who: contacts.display_name,
+      platform: channels.platform,
+    })
+    .from(messageReactions)
+    .leftJoin(contacts, eq(contacts.id, messageReactions.contact_id))
+    .leftJoin(channels, eq(channels.id, messageReactions.channel_id))
+    .where(and(
+      eq(messageReactions.workspace_id, workspaceId),
+      channelIds ? inArray(messageReactions.channel_id, channelIds) : undefined,
+    ))
+    .orderBy(desc(messageReactions.created_at))
+    .limit(50);
+  return rows.map((r) => ({
+    who: r.who ?? "Someone",
+    platform: r.platform ?? "—",
+    emoji: r.emoji ?? REACTION_EMOJI[r.type] ?? "💬",
+    type: r.type,
+    at: r.created_at,
+  }));
+}
+
+interface EngagementFilter {
+  channels: InboxChannel[];
+  brands: BrandRow[];
+  brand: string;
+  channel: string;
+}
+
+/** Brand + account filter bar for Engagement. Plain GET form (CSP-safe, no inline JS): picking a
+ *  brand scopes to all its channels; picking a specific channel/account wins over the brand. */
+function engagementFilterBar(f: EngagementFilter): Html {
+  if (f.channels.length === 0) return html``;
+  const anyUnassigned = f.channels.some((ch) => !ch.brand_key);
+  return html`<form method="get" action="/engagement" class="filter-bar" style="margin:.5rem 0 1rem">
+    <label class="fld" style="gap:4px"><span>Brand</span>
+      <select name="brand">
+        <option value="all" ${f.brand === "all" ? "selected" : ""}>All brands</option>
+        ${f.brands.map((b) => html`<option value="${b.key}" ${f.brand === b.key ? "selected" : ""}>${b.name}</option>`)}
+        ${anyUnassigned ? html`<option value="__unassigned__" ${f.brand === "__unassigned__" ? "selected" : ""}>Unassigned</option>` : ""}
+      </select>
+    </label>
+    <label class="fld" style="gap:4px"><span>Account</span>
+      <select name="channel">
+        <option value="all" ${f.channel === "all" ? "selected" : ""}>All accounts</option>
+        ${renderInboxChannelOptions(f.channels, f.channel)}
+      </select>
+    </label>
+    ${btn({ label: "Filter", variant: "primary", size: "sm", attrs: 'type="submit"' })}
+    ${f.brand !== "all" || f.channel !== "all" ? html`<a class="btn btn-sm btn-ghost" href="/engagement">Clear</a>` : ""}
+  </form>`;
+}
+
+function renderEngagement(posts: EngagementPost[], dms: DmReaction[], filter: EngagementFilter): Html {
+  return html`<div class="page">
+    <h1>Engagement</h1>
+    <p class="section-intro">Who reacted to your posts and messages.</p>
+
+    ${engagementFilterBar(filter)}
+
+    <div class="callout">${icon("info", "ico", 15)}<div>
+      <strong>Platform coverage:</strong> Facebook delivers <em>post</em> reactions (shown below).
+      Instagram does <strong>not</strong> send <strong>post likes</strong> or reactions over its API,
+      so they can't appear here — Instagram engagement instead arrives as <em>message reactions</em>
+      (below) and as comments in your <a href="/inbox">Inbox</a>.
+    </div></div>
+
+    <section class="section">
+      <h2>Post reactions <span class="panel-sub" style="font-weight:400">· Facebook</span></h2>
+      ${posts.length === 0
+        ? html`<div class="empty"><span class="empty-ic">${icon("events", "ico", 20)}</span><p class="empty-title">No post reactions yet</p><p class="empty-body">Reactions on your Facebook posts will show up here.</p></div>`
+        : html`<div class="table-wrap"><table><thead><tr><th>Post</th><th>Reactions</th><th>Breakdown</th><th>Who</th><th>Latest</th></tr></thead>
+            <tbody>
+              ${posts.map(
+                (p) => html`<tr>
+                  <td>
+                    ${p.channelName ? html`<div style="font-weight:600;color:var(--text-1)">${p.channelName}</div>` : ""}
+                    <a href="https://www.facebook.com/${p.postId}" target="_blank" rel="noopener">View post</a>
+                    <div class="muted-mono" style="font-size:.68rem">${p.postId}</div>
+                  </td>
+                  <td><span style="font-family:var(--font-mono);font-weight:600;color:var(--text-1)">${p.total}</span></td>
+                  <td><span class="pill-row">${p.byType.map((t) => html`<span class="badge" title="${t.type}">${REACTION_EMOJI[t.type] ?? t.type} ${t.n}</span>`)}</span></td>
+                  <td><small>${p.reactors.length ? p.reactors.join(", ") : "—"}</small></td>
+                  <td><span class="muted-mono">${timeAgo(p.lastAt)}</span></td>
+                </tr>`,
+              )}
+            </tbody></table></div>`}
+    </section>
+
+    <section class="section">
+      <h2>Message reactions <span class="panel-sub" style="font-weight:400">· Facebook &amp; Instagram DMs</span></h2>
+      ${dms.length === 0
+        ? html`<div class="empty"><span class="empty-ic">${icon("comment", "ico", 20)}</span><p class="empty-title">No message reactions yet</p><p class="empty-body">When someone reacts to one of your direct messages, it shows up here.</p></div>`
+        : html`<div class="table-wrap"><table><thead><tr><th>Who</th><th>Reaction</th><th>Platform</th><th>When</th></tr></thead>
+            <tbody>
+              ${dms.map(
+                (d) => html`<tr>
+                  <td>${d.who}</td>
+                  <td><span class="badge" title="${d.type}">${d.emoji} ${d.type}</span></td>
+                  <td>${PLATFORM_LABELS[d.platform] ?? d.platform}</td>
+                  <td><span class="muted-mono">${d.at.toISOString().slice(0, 16).replace("T", " ")}</span></td>
+                </tr>`,
+              )}
+            </tbody></table></div>`}
+    </section>
+  </div>`;
+}
+
+/** WEBHOOKSUB1: per-account webhook subscription health (active vs missing fields) + a one-click Fix.
+ *  `message_reactions` may be subscribed yet undelivered by Meta until pages_messaging has Advanced
+ *  Access — so a present-but-noted hint is shown rather than implying a local misconfig. */
+export function renderSubscriptionPanel(statuses: ChannelSubscriptionStatus[]): Html {
+  if (statuses.length === 0) {
+    return html`<div id="wh-subs"><div class="empty"><span class="empty-ic">${icon("channels", "ico", 20)}</span><p class="empty-title">No accounts connected</p><p class="empty-body">Connect a Facebook or Instagram account to manage its webhook subscriptions.</p></div></div>`;
+  }
+  const fieldBadges = (fields: string[], tone: string) =>
+    fields.length ? html`<span class="pill-row">${fields.map((f) => html`<span class="badge tone-${tone}">${f}</span>`)}</span>` : html`<span style="color:var(--text-3)">—</span>`;
+  return html`<div id="wh-subs"><div class="table-wrap"><table><thead><tr><th>Account</th><th>Active</th><th>Missing</th><th class="th-act"></th></tr></thead>
+    <tbody>${statuses.map(
+      (s) => html`<tr>
+        <td>
+          <div style="font-weight:600;color:var(--text-1)">${PLATFORM_LABELS[s.platform] ?? s.platform} · ${s.displayName ?? s.channelId}</div>
+          ${s.kind === "instagram_login"
+            ? html`<div style="font-size:.68rem;color:var(--text-3);margin-top:2px"><small>Per-account Instagram Login subscription</small></div>`
+            : ""}
+          ${s.igLogin
+            ? html`<div style="font-size:.66rem;color:var(--text-3);margin-top:2px"><small>Two subscriptions: the linked <strong>Facebook Page</strong> (the fields on the right) and <strong>Instagram Login</strong> (per-account, shown below).</small></div>`
+            : ""}
+          ${s.error
+            ? html`<div style="font-size:.72rem;color:var(--bad-text);margin-top:3px">${s.error}</div>`
+            : s.ok
+              ? html`<div style="display:flex;align-items:center;gap:5px;font-size:.72rem;color:var(--text-3);margin-top:3px">${dot("ok")} ${s.igLogin ? "Facebook Page — fully subscribed" : "Fully subscribed"}</div>`
+              : html`<div style="display:flex;align-items:center;gap:5px;font-size:.72rem;color:var(--text-3);margin-top:3px">${dot("warn")} ${s.igLogin ? "Facebook Page — " : ""}Missing ${s.missing.length} field(s)</div>`}
+          ${s.kind === "page" && s.active.includes("message_reactions")
+            ? html`<div style="display:flex;align-items:flex-start;gap:5px;font-size:.68rem;color:var(--text-3);margin-top:4px">${icon("info", "ico", 12)}<span>message_reactions on the Facebook Page is subscribed, but Meta only delivers it once <code>pages_messaging</code> has Advanced Access (App Review).${s.igLogin ? " Instagram DM reactions (via Instagram Login below) deliver on Standard Access — no review needed." : ""}</span></div>`
+            : ""}
+          ${s.igLogin
+            ? html`<div style="margin-top:8px;padding-top:6px;border-top:1px solid var(--border)">
+                <div style="display:flex;align-items:center;gap:5px;font-size:.72rem;color:var(--text-2);font-weight:600">${dot(s.igLogin.error ? "warn" : s.igLogin.ok ? "ok" : "warn")} Instagram Login (per-account)</div>
+                ${s.igLogin.error
+                  ? html`<div style="font-size:.72rem;color:var(--bad-text);margin-top:3px">${s.igLogin.error}</div>`
+                  : html`<div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:4px;font-size:.68rem">
+                      <span style="color:var(--text-3)">Active:</span>${fieldBadges(s.igLogin.active, "ok")}
+                      <span style="color:var(--text-3)">Missing:</span>${fieldBadges(s.igLogin.missing, "warn")}
+                    </div>`}
+              </div>`
+            : ""}
+        </td>
+        <td style="max-width:22rem">${fieldBadges(s.active, "ok")}</td>
+        <td style="max-width:18rem">${fieldBadges(s.missing, "warn")}</td>
+        <td class="th-act">${s.missing.length || (s.igLogin && (s.igLogin.missing.length || s.igLogin.error))
+          ? html`<button class="btn btn-sm btn-primary" hx-post="/webhooks/subscriptions/${s.channelId}/fix" hx-target="#wh-subs" hx-swap="outerHTML">Fix</button>`
+          : html`<button class="btn btn-sm" hx-post="/webhooks/subscriptions/${s.channelId}/fix" hx-target="#wh-subs" hx-swap="outerHTML" title="Re-apply the full subscription">Re-apply</button>`}</td>
+      </tr>`,
+    )}</tbody></table></div></div>`;
+}
+
+interface OverviewPublishing {
+  attention: AttentionRow[];
+  upcoming: UpcomingPost[];
+  recent: RecentEvent[];
+}
+
+/** The publishing wing's slice of the unified overview: attention hero + upcoming + recent events. */
+function renderPublishingOverview(pub: OverviewPublishing): Html {
+  const attention = pub.attention.length
+    ? html`<section class="panel" style="margin:1rem 0">
+        <div class="panel-head"><h3>Needs attention</h3><span class="panel-count">${pub.attention.length}</span></div>
+        ${pub.attention.map((a) => {
+          // Title body (name · reason). Linked to the entity's detail view when we know where it
+          // lives, so the whole row is a click-through — otherwise a plain span (no dead link).
+          const body = html`${a.title} <span style="color:var(--text-3);font-weight:400">· ${a.reason}</span>`;
+          const title = a.detailHref
+            ? html`<a class="attn-title attn-link" href="${a.detailHref}" title="${a.reason}">${body}</a>`
+            : html`<span class="attn-title" title="${a.reason}">${body}</span>`;
+          return html`<div class="attn-row">
+            ${dot(a.tone)}
+            ${a.platform ? html`<span class="attn-plat">${platformCell(a.platform, a.metadata)}</span>` : ""}
+            ${title}
+            <span class="attn-acts"><a class="btn btn-sm ${a.action.variant === "primary" ? "btn-primary" : "btn-secondary"}" href="${a.action.href}">${a.action.label}</a></span>
+          </div>`;
+        })}
+      </section>`
+    : html`<section class="panel" style="margin:1rem 0"><div class="panel-head"><h3>Needs attention</h3></div><div class="empty"><span class="empty-ic">${icon("check", "ico", 20)}</span><p class="empty-title">All healthy</p><p class="empty-body">No channels, sources or deliveries need a fix.</p></div></section>`;
+  const upcoming = html`<section class="panel">
+      <div class="panel-head"><h3>Upcoming</h3><a class="panel-more" href="/queue?status=scheduled">Queue →</a></div>
+      ${pub.upcoming.length
+        ? pub.upcoming.map((u) => html`<div class="up-row"><span class="up-time">${relTimeShort(u.scheduledAt)}</span><span class="up-title">${PLATFORM_LABELS[u.platform] ?? u.platform} · ${u.format}</span><span class="up-channel">${u.channelName}</span></div>`)
+        : html`<div class="empty"><p class="empty-body">Nothing scheduled.</p></div>`}
+    </section>`;
+  const recent = html`<section class="panel">
+      <div class="panel-head"><h3>Recent events</h3><a class="panel-more" href="/events">Events →</a></div>
+      ${pub.recent.length
+        ? pub.recent.map((e) => {
+            const m = EVENT_META[e.type];
+            return html`<div class="feed-row">${dot(m?.tone ?? "neutral")}<span class="feed-main"><span class="feed-type">${m?.label ?? e.type}</span>${m ? html`<span class="feed-detail">${e.type}</span>` : ""}</span><span class="feed-time">${timeAgo(e.createdAt)}</span></div>`;
+          })
+        : html`<div class="empty"><p class="empty-body">No events yet.</p></div>`}
+    </section>`;
+  return html`${attention}<div class="dash-grid">${upcoming}${recent}</div>`;
+}
+
+/** A compact relative time for the upcoming feed ("in 22m" / "12d ago"). */
+function relTimeShort(at: Date): string {
+  const ms = at.getTime() - Date.now();
+  const abs = Math.abs(ms);
+  const day = 86400000;
+  const v = abs < 3600000 ? `${Math.max(1, Math.round(abs / 60000))}m` : abs < day ? `${Math.round(abs / 3600000)}h` : `${Math.round(abs / day)}d`;
+  return ms >= 0 ? `in ${v}` : `${v} ago`;
+}
+
+function renderOverview(ov: Awaited<ReturnType<typeof loadOverview>>, features: Set<Feature>, upgradeUrl: string, pub: OverviewPublishing | null = null, responseTimes: ResponseTimeStats | null = null): Html {
+  const locked = !features.has("contacts_crm");
+  const rt = responseTimes?.overall;
+  // Only meaningful once we've handled something; otherwise the tiles would read "0% / —".
+  const showRt = rt != null && rt.total_count > 0;
+  return html`<div class="page">
+    <h1>Overview</h1>
+    <p class="section-intro">Your automation at a glance.${locked ? html` Replying to conversations by hand is ${proLink(upgradeUrl, "PRO")} — your rules auto-reply for free.` : html``}</p>
+    <div class="kpis" style="margin:14px 0">
+      ${kpi({ label: "Sent today", value: ov.today, tone: "neutral" })}
+      ${kpi({ label: "Sent (all time)", value: ov.sent, tone: "ok" })}
+      ${kpi({ label: "Failed", value: ov.failed, tone: ov.failed > 0 ? "bad" : "neutral" })}
+      ${kpi({ label: "Held", value: ov.held, tone: ov.held > 0 ? "warn" : "neutral" })}
+      ${kpi({ label: "Contacts", value: ov.contactCount, tone: "neutral" })}
+      ${showRt
+        ? html`${kpi({ label: `Avg first reply (${DEFAULT_WINDOW_DAYS}d)`, value: formatLatencyMs(rt!.avg_first_response_ms), tone: "info" })}
+            ${kpi({ label: `Answer rate (${DEFAULT_WINDOW_DAYS}d)`, value: `${rt!.answer_rate_pct}%`, tone: rt!.answer_rate_pct >= 80 ? "ok" : "neutral" })}`
+        : ""}
+    </div>
+    ${pub ? renderPublishingOverview(pub) : ""}
+    <section class="section">
+      <h2>Recent activity</h2>
+      ${ov.recentSends.length === 0
+        ? html`<div class="empty"><span class="empty-ic">${icon("send", "ico", 20)}</span><p class="empty-title">No messages sent yet</p><p class="empty-body">Connect a channel and add a keyword rule to start auto-replying.</p></div>`
+        : html`<div class="table-wrap"><table><thead><tr><th>Type</th><th>Channel</th><th>Status</th><th>When</th></tr></thead>
+            <tbody>
+              ${ov.recentSends.map(
+                (r) => html`<tr>
+                  <td><span style="color:var(--text-1)">${r.label}</span></td>
+                  <td>${r.platform ? PLATFORM_LABELS[r.platform] ?? r.platform : "—"}</td>
+                  <td>${statusBadge(r.status)}</td>
+                  <td><span class="muted-mono">${timeAgo(r.createdAt)}</span></td>
+                </tr>`,
+              )}
+            </tbody></table></div>
+          ${locked ? html`<p class="section-intro" style="margin-top:.75rem">This log shows what was sent, without client details. To see who you talked to, ${proLink(upgradeUrl, "upgrade to PRO")}.</p>` : html``}`}
+    </section>
+  </div>`;
+}
+
+/** Read-only publishing-provider status (merged from PostStack settings): which publish providers
+ *  are registered and whether their OAuth client env is configured. Self-hoster diagnostic. */
+function renderProvidersStatus(): Html {
+  const providers = listProviders();
+  return html`<section class="section">
+    <h2>Publishing providers</h2>
+    <p class="section-intro">Which publishing providers are available and whether their OAuth client credentials are configured.</p>
+    <div class="table-wrap"><table><thead><tr><th>Provider</th><th>OAuth</th></tr></thead><tbody>
+      ${providers.map((p) => {
+        const configured = !!p.oauthConfig?.();
+        return html`<tr><td><span style="color:var(--text-1);font-weight:500">${p.id}</span></td><td>${configured ? pillBadge("configured", "ok") : pillBadge("not configured", "neutral")}</td></tr>`;
+      })}
+    </tbody></table></div>
+  </section>`;
+}
+
+function renderLicense(state: LicenseState, msg?: string, msgOk = false): Html {
+  const notice = msg ? html`<div class="notice ${msgOk ? "notice-ok" : "notice-err"}">${msg}</div>` : html``;
+  const sourceLabel = state.source === "db" ? "panel" : state.source === "env" ? "environment variable" : "—";
+  // When the active license comes from the LICENSE_KEY env var (server config), make it explicit —
+  // otherwise the panel looks "empty" (no stored token) even though PRO is active, which is confusing.
+  const envNote = state.source === "env"
+    ? html`<div class="notice notice-info">ℹ This license is provided by the <code>LICENSE_KEY</code> environment variable (server config), not the panel — so there's nothing to paste here. To change it, update the env var. Pasting a token below would override the env one via the panel.</div>`
+    : html``;
+  return html`${notice}${envNote}
+    <div class="card" style="margin-bottom:1rem">
+      <div><strong>Status:</strong> <span class="badge">${state.status}</span>${state.tier ? html` &nbsp;<strong>Tier:</strong> ${state.tier}` : html``}${state.expiresAt ? html` &nbsp;<span class="muted">expires ${new Date(state.expiresAt).toLocaleDateString()}</span>` : html``}</div>
+      ${state.products.size > 0 ? html`<div style="margin-top:.4rem"><strong>Products:</strong> ${[...state.products].map((p) => html`<span class="badge">${p}</span> `)}</div>` : html``}
+      ${state.features.size > 0 ? html`<div class="muted" style="margin-top:.4rem">Unlocked: ${[...state.features].join(", ")}</div>` : html``}
+      <div class="muted" style="margin-top:.4rem;font-size:.8rem">Source: ${sourceLabel}</div>
+    </div>
+    <div class="row">
+      ${state.status !== "active" ? html`<a class="btn btn-primary" href="${state.upgradeUrl}" target="_blank" rel="noopener">Buy PRO</a>` : html``}
+      ${state.source === "db" ? html`<button class="btn btn-sm" hx-post="/settings/license/clear" hx-target="#license-area" hx-swap="innerHTML" hx-confirm="Remove the stored license token?">Remove license</button>` : html``}
+    </div>`;
+}
+
+/** Parse a JSON-array string from the rule form (quick replies / buttons); returns [] on anything else. */
+function parseJsonArray(raw: string | undefined): unknown[] {
+  if (!raw) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+async function loadRules(workspaceId: string) {
+  const [rows, chans] = await Promise.all([
+    db.query.autoReplyRules.findMany({
+      where: eq(autoReplyRules.workspace_id, workspaceId),
+      orderBy: [desc(autoReplyRules.priority), asc(autoReplyRules.created_at)],
+      limit: 200,
+      columns: { id: true, name: true, is_active: true, trigger_type: true, response_type: true, channel_id: true, trigger_config: true, response_config: true },
+    }),
+    loadInboxChannels(workspaceId),
+  ]);
+  const label = new Map(chans.map((ch) => [ch.id, `${PLATFORM_LABELS[ch.platform] ?? ch.platform} · ${ch.display_name ?? ch.username ?? ch.id}`]));
+  // Resolve names for any sequence-response rules so the list shows the drip, not a bare uuid.
+  const seqIds = rows
+    .filter((r) => r.response_type === "sequence")
+    .map((r) => (r.response_config as Record<string, unknown> | null)?.sequence_id)
+    .filter((id): id is string => typeof id === "string");
+  const seqNames = seqIds.length
+    ? new Map(
+        (await db.query.sequences.findMany({ where: inArray(sequencesTbl.id, seqIds), columns: { id: true, name: true } })).map((seq) => [seq.id, seq.name]),
+      )
+    : new Map<string, string>();
+  return rows.map((r) => ({
+    ...r,
+    channelLabel: r.channel_id ? label.get(r.channel_id) ?? "Unknown channel" : "All channels",
+    sequenceName:
+      r.response_type === "sequence"
+        ? seqNames.get((r.response_config as Record<string, unknown> | null)?.sequence_id as string) ?? "(deleted sequence)"
+        : null,
+  }));
+}
+
+/** A human-readable one-line summary of what a rule actually does — keywords, post scope, reply mode,
+ *  the reply text, and the action buttons / quick replies — so the list isn't opaque (RULESVIEW1). */
+function ruleSummary(r: Awaited<ReturnType<typeof loadRules>>[number]): Html {
+  const tc = (r.trigger_config ?? {}) as Record<string, unknown>;
+  const rc = (r.response_config ?? {}) as Record<string, unknown>;
+  const bits: Html[] = [];
+  const chip = (ic: Parameters<typeof icon>[0], body: Html) => html`<span class="badge tone-neutral">${icon(ic, "ico", 12)} ${body}</span>`;
+  const kws = Array.isArray(tc.keywords)
+    ? (tc.keywords as Array<string | { value?: string }>).map((k) => (typeof k === "string" ? k : k.value ?? "")).filter(Boolean)
+    : [];
+  if (kws.length) bits.push(chip("key", html`${kws.join(", ")}`));
+  if (r.trigger_type === "comment_keyword") {
+    bits.push(chip("comment", html`${typeof tc.post_id === "string" && tc.post_id ? `post ${tc.post_id}` : "any post"}`));
+    if (typeof rc.reply_mode === "string") bits.push(chip("send", html`${rc.reply_mode}`));
+  }
+  if (r.response_type === "sequence" && r.sequenceName) bits.push(chip("reopen", html`enroll → ${r.sequenceName}`));
+  if (typeof rc.text === "string" && rc.text.trim()) bits.push(html`<span class="badge tone-neutral">“${truncateCodePoints(rc.text, 60)}”</span>`);
+  if (rc.ai_rephrase === true) bits.push(chip("sparkles", html`AI rephrase`));
+  const buttons = Array.isArray(rc.buttons) ? (rc.buttons as Array<{ title?: string; url?: string; payload?: string }>) : [];
+  for (const b of buttons) bits.push(chip("command", html`${b.title ?? ""}${b.url ? html` → <a href="${b.url}" target="_blank" rel="noopener">${b.url}</a>` : b.payload ? ` (${b.payload})` : ""}`));
+  const qr = Array.isArray(rc.quick_replies) ? (rc.quick_replies as Array<{ content_type?: string; title?: string }>) : [];
+  const qrLabels = qr.map((q) => (q.content_type === "user_email" ? "ask email" : q.content_type === "user_phone_number" ? "ask phone" : q.title ?? "reply"));
+  if (qrLabels.length) bits.push(chip("events", html`${qrLabels.join(", ")}`));
+  if (!bits.length) return html``;
+  return html`<div style="display:flex;flex-wrap:wrap;gap:5px;margin-top:6px">${bits}</div>`;
+}
+
+function renderRules(rulesList: Awaited<ReturnType<typeof loadRules>>, error?: string): Html {
+  const notice = error ? html`<div class="notice notice-err">${error}</div>` : html``;
+  if (rulesList.length === 0) return html`${notice}<div class="empty"><span class="empty-ic">${icon("sparkles", "ico", 20)}</span><p class="empty-title">No rules yet</p><p class="empty-body">Add a keyword rule above to auto-reply to DMs and comments.</p></div>`;
+  return html`${notice}<div class="table-wrap"><table>
+    <thead><tr><th>Rule</th><th>Status</th><th class="th-act">Actions</th></tr></thead>
+    <tbody>${rulesList.map(
+      (r) => html`<tr>
+        <td>
+          <div style="font-weight:600;color:var(--text-1)">${r.name}</div>
+          <div style="margin-top:2px"><span class="mode-tag">${r.trigger_type} → ${r.response_type}</span> <small>· ${r.channelLabel}</small></div>
+          ${ruleSummary(r)}
+        </td>
+        <td>${r.is_active ? html`<span class="badge tone-ok">Active</span>` : html`<span class="badge tone-neutral">Paused</span>`}</td>
+        <td class="th-act"><div class="wh-actions" style="justify-content:flex-end">
+          <button class="btn btn-sm" hx-get="/rules/${r.id}/edit" hx-target="#rules-list" hx-swap="innerHTML">Edit</button>
+          <button class="btn btn-sm" hx-get="/rules/${r.id}/duplicate" hx-target="#rules-list" hx-swap="innerHTML">Duplicate</button>
+          <button class="btn btn-sm" hx-post="/rules/${r.id}/toggle" hx-target="#rules-list" hx-swap="innerHTML">${r.is_active ? "Pause" : "Activate"}</button>
+          <button class="btn btn-sm btn-danger" hx-delete="/rules/${r.id}" hx-target="#rules-list" hx-swap="innerHTML" hx-confirm="Delete this rule?">Delete</button>
+        </div></td>
+      </tr>`,
+    )}</tbody></table></div>`;
+}
+
+/** The x-data methods that serialize the quick-reply / button editor rows into the hidden JSON inputs
+ *  the rule POST handlers read. Shared verbatim by the create and edit rule forms (DRY). */
+const RULE_EDITOR_METHODS = `qrJson() {
+  return JSON.stringify(this.quickReplies
+    .filter(q => q.content_type !== 'text' || (q.title && q.title.trim()))
+    .map(q => q.content_type === 'text'
+      ? { content_type: 'text', title: q.title.trim(), payload: (q.payload && q.payload.trim()) ? q.payload.trim() : q.title.trim() }
+      : { content_type: q.content_type }));
+},
+btnJson() {
+  return JSON.stringify(this.buttons
+    .filter(b => b.title && b.title.trim() && b.value && b.value.trim())
+    .map(b => b.kind === 'url' ? { title: b.title.trim(), url: b.value.trim() } : { title: b.title.trim(), payload: b.value.trim() }));
+}`;
+
+/** Channel-scope selector for a rule: "All channels" (channel_id null) or one specific channel.
+ *  Shared by the create and edit rule forms. */
+function ruleChannelSelect(chans: InboxChannel[], selected: string | null): Html {
+  return html`<div><label class="label">Channel</label>
+    <select class="input" name="channel_id">
+      <option value=""${selected ? raw("") : raw(" selected")}>All channels</option>
+      ${chans.map((ch) => html`<option value="${ch.id}"${selected === ch.id ? raw(" selected") : raw("")}>${PLATFORM_LABELS[ch.platform] ?? ch.platform} · ${ch.display_name ?? ch.username ?? ch.id}</option>`)}
+    </select>
+    <p class="muted" style="font-size:.7rem;margin-top:.2rem">Limit this rule to one channel (e.g. only YouTube), or leave "All channels" to apply everywhere.</p>
+  </div>`;
+}
+
+/** The sequence picker for a `sequence`-response rule (SEQTRIGGER1): the matched contact is enrolled
+ *  into the chosen drip. Shown only when responseMode === 'sequence'; requires the form's x-data to
+ *  expose `responseMode`. `selected` pre-selects the stored sequence on the edit form. */
+function sequenceResponseField(
+  activeSequences: Array<{ id: string; name: string; _count: { enrollments: number } }>,
+  selected: string | null,
+): Html {
+  return html`<div x-show="responseMode === 'sequence'" class="stack">
+    ${activeSequences.length === 0
+      ? html`<div class="card" style="font-size:.8rem"><span class="muted">No active sequences yet.</span> <a href="/sequences">Create one</a>, activate it, then pick it here.</div>`
+      : html`<div><label class="label">Sequence to enroll into</label>
+          <select class="input" name="sequence_id">
+            ${activeSequences.map((seq) => html`<option value="${seq.id}"${selected === seq.id ? raw(" selected") : raw("")}>${seq.name}</option>`)}
+          </select>
+          <p class="muted" style="font-size:.72rem;margin-top:.25rem">When this trigger fires, the contact is enrolled into the drip (once per contact). Manage steps &amp; delays in <a href="/sequences">Sequences</a>.</p>
+        </div>`}
+  </div>`;
+}
+
+/** The action-button + quick-reply editor (link buttons, ask-email/phone) sent inside DMs. Shared by
+ *  the create and edit rule forms; requires the form's x-data to expose quickReplies[]/buttons[]. */
+function interactiveRuleFields(canInteractive: boolean, upgradeUrl: string): Html {
+  if (!canInteractive) {
+    return html`<div x-show="responseMode === 'text'" class="card" style="font-size:.78rem"><span class="muted">Buttons &amp; quick replies are a PRO feature.</span> ${proLink(upgradeUrl, "Upgrade")}</div>`;
+  }
+  return html`<div x-show="responseMode === 'text'">
+      <label class="label">Quick replies (tappable chips above the text box · max 13)</label>
+      <template x-for="(q, i) in quickReplies" :key="i">
+        <div style="display:flex;gap:.4rem;margin-bottom:.4rem">
+          <select class="input" x-model="q.content_type" style="max-width:150px">
+            <option value="text">Text</option>
+            <option value="user_email">Ask email</option>
+            <option value="user_phone_number">Ask phone</option>
+          </select>
+          <input class="input" placeholder="Label (≤20)" maxlength="20" x-model="q.title" x-show="q.content_type === 'text'" />
+          <input class="input" placeholder="Payload (tap value)" x-model="q.payload" x-show="q.content_type === 'text'" />
+          <button class="btn btn-sm btn-danger" type="button" @click="quickReplies.splice(i, 1)">×</button>
+        </div>
+      </template>
+      <button class="btn btn-sm" type="button" @click="quickReplies.push({ content_type: 'text', title: '', payload: '' })" x-show="quickReplies.length < 13">+ quick reply</button>
+    </div>
+
+    <div x-show="responseMode === 'text'">
+      <label class="label">Buttons (shown inside the message · max 3)</label>
+      <template x-for="(b, i) in buttons" :key="i">
+        <div style="display:flex;gap:.4rem;margin-bottom:.4rem">
+          <input class="input" placeholder="Label (≤20)" maxlength="20" x-model="b.title" />
+          <select class="input" x-model="b.kind" style="max-width:170px">
+            <option value="postback">Reply (postback)</option>
+            <option value="url">Open link</option>
+          </select>
+          <input class="input" :placeholder="b.kind === 'url' ? 'https://…' : 'PAYLOAD'" x-model="b.value" />
+          <button class="btn btn-sm btn-danger" type="button" @click="buttons.splice(i, 1)">×</button>
+        </div>
+      </template>
+      <button class="btn btn-sm" type="button" @click="buttons.push({ title: '', kind: 'postback', value: '' })" x-show="buttons.length < 3">+ button</button>
+      <p class="muted" style="font-size:.7rem;margin-top:.25rem">Instagram supports postback + link buttons; quick-reply icons and extra button types are Messenger-only.</p>
+    </div>`;
+}
+
+/** Map a stored response_config to the editor's row shapes for x-data pre-fill. */
+function buttonsToEditor(rc: Record<string, unknown>): { quickReplies: unknown[]; buttons: unknown[] } {
+  const quickReplies = (Array.isArray(rc.quick_replies) ? rc.quick_replies : []).map((q) => {
+    const o = (q ?? {}) as { content_type?: string; title?: string; payload?: string };
+    return { content_type: o.content_type ?? "text", title: o.title ?? "", payload: o.payload ?? "" };
+  });
+  const buttons = (Array.isArray(rc.buttons) ? rc.buttons : []).map((b) => {
+    const o = (b ?? {}) as { title?: string; url?: string; payload?: string };
+    return o.url !== undefined
+      ? { title: o.title ?? "", kind: "url", value: o.url ?? "" }
+      : { title: o.title ?? "", kind: "postback", value: o.payload ?? "" };
+  });
+  return { quickReplies, buttons };
+}
+
+function loadRuleForEdit(workspaceId: string, id: string) {
+  return db.query.autoReplyRules.findFirst({
+    where: and(eq(autoReplyRules.id, id), eq(autoReplyRules.workspace_id, workspaceId)),
+    columns: { id: true, name: true, channel_id: true, trigger_type: true, trigger_config: true, response_type: true, response_config: true, requires_approval: true },
+  });
+}
+
+/** Inline edit form for a rule. Edits the common fields AND the DM action buttons / quick replies
+ *  (link buttons, ask-email/phone), pre-filled from the stored config — the same editor as the
+ *  create form, so an imported rule's buttons are visible and changeable, not opaque. */
+function renderRuleEditForm(
+  r: NonNullable<Awaited<ReturnType<typeof loadRuleForEdit>>>,
+  canInteractive: boolean,
+  upgradeUrl: string,
+  channels: InboxChannel[],
+  activeSequences: Array<{ id: string; name: string; _count: { enrollments: number } }> = [],
+  canAiRephrase = false,
+  aiConfigured = true,
+): Html {
+  const tc = (r.trigger_config ?? {}) as Record<string, unknown>;
+  const rc = (r.response_config ?? {}) as Record<string, unknown>;
+  const keywords = Array.isArray(tc.keywords)
+    ? (tc.keywords as Array<string | { value?: string }>).map((k) => (typeof k === "string" ? k : k.value ?? "")).filter(Boolean).join(", ")
+    : "";
+  const postId = typeof tc.post_id === "string" ? tc.post_id : "";
+  const text = typeof rc.text === "string" ? rc.text : "";
+  const replyMode = typeof rc.reply_mode === "string" ? rc.reply_mode : "dm";
+  const commentReply = typeof rc.comment_reply_text === "string" ? rc.comment_reply_text : "";
+  const isText = r.response_type === "text";
+  const isSequence = r.response_type === "sequence";
+  const selectedSequence = typeof rc.sequence_id === "string" ? rc.sequence_id : null;
+  const isKeyword = r.trigger_type === "keyword" || r.trigger_type === "comment_keyword";
+  const isComment = r.trigger_type === "comment_keyword";
+  const sel = (v: string) => (v === replyMode ? raw(" selected") : raw(""));
+  const { quickReplies, buttons } = buttonsToEditor(rc);
+  // Pre-fill the Alpine editor: the init arrays are interpolated as normal values so the html`` tag
+  // HTML-escapes them (safe in the attribute, the browser un-escapes for Alpine); the methods are raw
+  // code (their `=>` / `{}` must not be escaped). `responseMode` drives the x-show of the sequence
+  // picker (and the text editor); it never changes on the edit form (you can't switch response type).
+  const xData = isText
+    ? html` x-data="{ responseMode: 'text', aiRephrase: ${rc.ai_rephrase === true ? raw("true") : raw("false")}, quickReplies: ${JSON.stringify(quickReplies)}, buttons: ${JSON.stringify(buttons)}, ${raw(RULE_EDITOR_METHODS)} }"`
+    : isSequence
+      ? html` x-data="{ responseMode: 'sequence' }"`
+      : html``;
+  return html`<section class="panel" style="margin-bottom:1rem">
+    <div class="panel-head"><h3>Edit rule</h3><span class="panel-sub">${r.trigger_type} → ${r.response_type}</span></div>
+    <form hx-post="/rules/${r.id}" hx-ext="json-enc" hx-target="#rules-list" hx-swap="innerHTML" class="stack" style="max-width:none;padding:14px 16px;background:transparent;border:0;border-radius:0;gap:12px"${xData}>
+      <div><label class="label">Name</label><input class="input" name="name" value="${r.name}" required /></div>
+      ${ruleChannelSelect(channels, r.channel_id)}
+      ${isKeyword ? html`<div><label class="label">Keywords (comma-separated)</label><input class="input" name="keywords" value="${keywords}" placeholder="hello, hi, info" /></div>` : ""}
+      ${isComment ? html`<div><label class="label">Post ID (blank = any post)</label><input class="input" name="post_id" value="${postId}" placeholder="leave blank for any post" /></div>` : ""}
+      ${isComment && isText ? html`<div><label class="label">Reply via</label>
+        <select class="input" name="reply_mode">
+          <option value="dm"${sel("dm")}>DM only</option>
+          <option value="comment"${sel("comment")}>Public comment only</option>
+          <option value="both"${sel("both")}>Both</option>
+        </select>
+        <p class="muted" style="font-size:.7rem;margin-top:.2rem">Buttons &amp; quick replies are delivered in the DM — set "DM only" or "Both" to send them.</p></div>` : ""}
+      ${isText
+        ? html`<div><label class="label">Reply text</label><textarea class="textarea" name="text" rows="2">${text}</textarea></div>`
+        : isSequence
+          ? sequenceResponseField(activeSequences, selectedSequence)
+          : html`<p class="muted" style="font-size:.78rem">This rule's response type is <strong>${r.response_type}</strong>; its detailed configuration is preserved on save. To rebuild it, delete and recreate the rule.</p>`}
+      ${isComment && isText ? html`<div><label class="label">Public comment reply text (optional)</label><input class="input" name="comment_reply_text" value="${commentReply}" /></div>` : ""}
+      ${isText ? html`${interactiveRuleFields(canInteractive, upgradeUrl)}
+      ${canInteractive ? html`<input type="hidden" name="quick_replies_json" :value="qrJson()" /><input type="hidden" name="buttons_json" :value="btnJson()" />` : ""}` : ""}
+      ${isText && canAiRephrase ? html`<label class="row-center" style="font-size:.875rem;cursor:pointer">
+        <input type="checkbox" x-model="aiRephrase" />
+        <span>Rephrase with AI for variety <small class="muted">— sends a reworded version each time</small></span>
+      </label>
+      <input type="hidden" name="ai_rephrase" :value="aiRephrase" />
+      ${rephrasePromptFields(typeof rc.tone === "string" ? rc.tone : null, typeof rc.custom_prompt === "string" ? rc.custom_prompt : null, aiConfigured)}` : ""}
+      <label class="row-center" style="font-size:.875rem;cursor:pointer">
+        <input type="checkbox" name="requires_approval" value="true"${r.requires_approval ? raw(" checked") : raw("")} />
+        Hold for human approval before sending
+      </label>
+      <div class="row" style="gap:.5rem">
+        <button class="btn btn-primary" type="submit">Save changes</button>
+        <button class="btn btn-sm" type="button" hx-get="/rules/list" hx-target="#rules-list" hx-swap="innerHTML">Cancel</button>
+      </div>
+    </form>
+  </section>`;
+}
+
+type RuleCaps = {
+  canFollowGate: boolean;
+  canInteractive: boolean;
+  canPersonalize: boolean;
+  canReactionTrigger: boolean;
+  canSequence: boolean;
+  canAiRephrase: boolean;
+  aiConfigured: boolean;
+  upgradeUrl: string;
+};
+
+/** The full rule editor form — the same one behind "+ New rule", but with every field
+ *  pre-fillable. `prefill` is the source rule (for Duplicate); pass `null` for a blank form.
+ *  The form always POSTs to `/rules` (create): Duplicate is "create, pre-filled", not an edit —
+ *  nothing is saved until Submit and the source rule is never touched. `cancel` adds a Cancel
+ *  button (Duplicate swaps #rules-list in place, so it needs an escape hatch back to the list). */
+function ruleCreateForm(
+  caps: RuleCaps,
+  channels: InboxChannel[],
+  activeSequences: Array<{ id: string; name: string; _count: { enrollments: number } }>,
+  prefill: NonNullable<Awaited<ReturnType<typeof loadRuleForEdit>>> | null,
+  cancel: boolean,
+): Html {
+  const p = prefill;
+  const tc = p ? ((p.trigger_config ?? {}) as Record<string, unknown>) : {};
+  const rc = p ? ((p.response_config ?? {}) as Record<string, unknown>) : {};
+  const triggerType = p?.trigger_type ?? "keyword";
+  const responseMode = p?.response_type ?? "text";
+  const keywords = Array.isArray(tc.keywords)
+    ? (tc.keywords as Array<string | { value?: string }>).map((k) => (typeof k === "string" ? k : k.value ?? "")).filter(Boolean).join(", ")
+    : "";
+  const postId = typeof tc.post_id === "string" ? tc.post_id : "";
+  const payload = typeof tc.payload === "string" ? tc.payload : "";
+  const text = typeof rc.text === "string" ? rc.text : "";
+  const replyMode = typeof rc.reply_mode === "string" ? rc.reply_mode : "dm";
+  const commentReply = typeof rc.comment_reply_text === "string" ? rc.comment_reply_text : "";
+  const followedText = typeof (rc.followed as { text?: string } | undefined)?.text === "string" ? (rc.followed as { text?: string }).text! : "";
+  const nf = rc.not_followed as { text?: string; buttons?: Array<{ title?: string }> } | undefined;
+  const notFollowedText = typeof nf?.text === "string" ? nf.text : "";
+  const claimLabel = nf?.buttons?.[0]?.title ?? "";
+  const selectedSequence = typeof rc.sequence_id === "string" ? rc.sequence_id : null;
+  const aiRephrase = rc.ai_rephrase === true;
+  const requiresApproval = p?.requires_approval === true;
+  const name = p ? `${p.name} (copy)` : "";
+  const channelId = p?.channel_id ?? null;
+  const { quickReplies, buttons } = p ? buttonsToEditor(rc) : { quickReplies: [], buttons: [] };
+
+  const tSel = (v: string) => (v === triggerType ? raw(" selected") : raw(""));
+  const rSel = (v: string) => (v === responseMode ? raw(" selected") : raw(""));
+  const rmSel = (v: string) => (v === replyMode ? raw(" selected") : raw(""));
+
+  return html`<form hx-post="/rules" hx-ext="json-enc" hx-target="#rules-list" hx-swap="innerHTML" class="stack" style="margin-top:.75rem"
+      x-data="{
+        quickReplies: ${JSON.stringify(quickReplies)},
+        buttons: ${JSON.stringify(buttons)},
+        requiresApproval: ${requiresApproval ? raw("true") : raw("false")},
+        aiRephrase: ${aiRephrase ? raw("true") : raw("false")},
+        triggerType: '${triggerType}',
+        responseMode: '${responseMode}',
+        ${raw(RULE_EDITOR_METHODS)}
+      }">
+      <div><label class="label">Name</label><input class="input" name="name" value="${name}" required /></div>
+      ${ruleChannelSelect(channels, channelId)}
+      <div><label class="label">Trigger</label>
+        <select class="input" name="trigger_type" x-model="triggerType">
+          <option value="keyword"${tSel("keyword")}>DM keyword</option>
+          <option value="comment_keyword"${tSel("comment_keyword")}>Comment keyword</option>
+          <option value="postback"${tSel("postback")}>Button tap (postback)</option>
+          ${caps.canReactionTrigger
+            ? html`<option value="reaction"${tSel("reaction")}>Message reaction</option>`
+            : html`<option value="reaction" disabled>🔒 Message reaction (PRO)</option>`}
+        </select>
+      </div>
+      <div x-show="triggerType !== 'postback' && triggerType !== 'reaction'"><label class="label">Keywords (comma-separated)</label><input class="input" name="keywords" value="${keywords}" placeholder="hello, hi, info" /></div>
+      <div x-show="triggerType === 'reaction'"><p class="muted" style="font-size:.78rem">Fires when someone reacts to one of your messages — sends the reply below as a DM.</p></div>
+      <div x-show="triggerType === 'postback'"><label class="label">Button payload (must match the payload of the button you sent)</label><input class="input" name="payload" value="${payload}" placeholder="CLAIM_LM" /></div>
+      <div x-show="triggerType === 'comment_keyword'"><label class="label">Post ID (blank = any post)</label><input class="input" name="post_id" value="${postId}" placeholder="leave blank for any post" /></div>
+      <div x-show="triggerType === 'comment_keyword' && responseMode === 'text'"><label class="label">Reply via</label>
+        <select class="input" name="reply_mode">
+          <option value="dm"${rmSel("dm")}>DM only</option>
+          <option value="comment"${rmSel("comment")}>Public comment only</option>
+          <option value="both"${rmSel("both")}>Both</option>
+        </select>
+      </div>
+
+      <div><label class="label">Response</label>
+        <select class="input" name="response_mode" x-model="responseMode">
+          <option value="text"${rSel("text")}>Text reply (with optional buttons / quick replies)</option>
+          ${caps.canFollowGate
+            ? html`<option value="follow_gate"${rSel("follow_gate")}>Follow-gate (unlock only after they follow)</option>`
+            : html`<option value="follow_gate" disabled>🔒 Follow-gate (PRO)</option>`}
+          ${caps.canSequence
+            ? html`<option value="sequence"${rSel("sequence")}>Enroll in a drip sequence</option>`
+            : html`<option value="sequence" disabled>🔒 Enroll in a drip sequence (PRO)</option>`}
+        </select>
+      </div>
+
+      ${sequenceResponseField(activeSequences, selectedSequence)}
+
+      <!-- Follow-gate branches -->
+      <div x-show="responseMode === 'follow_gate'" class="stack">
+        <p class="muted" style="font-size:.75rem">Use with a Button-tap trigger. On each tap we check if they follow you, then send one of these. Instagram only.</p>
+        <div><label class="label">When they follow — final message (e.g. your resource link)</label><textarea class="textarea" name="followed_text" rows="2">${followedText}</textarea></div>
+        <div><label class="label">When they don't follow yet — re-prompt message</label><textarea class="textarea" name="not_followed_text" rows="2" placeholder="Follow us first, then tap again 🙏">${notFollowedText}</textarea></div>
+        <div><label class="label">Re-prompt button label</label><input class="input" name="claim_label" maxlength="20" value="${claimLabel}" placeholder="Chcę odebrać" /></div>
+      </div>
+
+      <div x-show="responseMode === 'text'"><label class="label">Reply text (DM / fallback)</label><textarea class="textarea" name="text" rows="2">${text}</textarea>
+        <p class="muted" style="font-size:.72rem;margin-top:.25rem">${caps.canPersonalize
+          ? html`Personalization: <code>{imie}</code> = first name, <code>{name}</code> = full name.`
+          : html`Personalization (<code>{imie}</code>/<code>{name}</code>) — ${proLink(caps.upgradeUrl)}`}</p>
+      </div>
+      <label x-show="responseMode === 'text'" class="row-center" style="font-size:.875rem;cursor:pointer">
+        ${caps.canAiRephrase
+          ? html`<input type="checkbox" x-model="aiRephrase" />
+              <span>Rephrase with AI for variety <small class="muted">— sends a reworded version each time (needs an AI provider in Settings)</small></span>`
+          : html`<input type="checkbox" disabled />
+              <span class="muted">🔒 Rephrase with AI for variety — ${proLink(caps.upgradeUrl)}</span>`}
+      </label>
+      ${caps.canAiRephrase ? rephrasePromptFields(typeof rc.tone === "string" ? rc.tone : null, typeof rc.custom_prompt === "string" ? rc.custom_prompt : null, caps.aiConfigured) : ""}
+      <div x-show="responseMode === 'text' && triggerType === 'comment_keyword'"><label class="label">Public comment reply text (optional)</label><input class="input" name="comment_reply_text" value="${commentReply}" /></div>
+
+      ${interactiveRuleFields(caps.canInteractive, caps.upgradeUrl)}
+
+      <label class="row-center" style="font-size:.875rem;cursor:pointer">
+        <input type="checkbox" x-model="requiresApproval" />
+        Hold for human approval before sending (review in Approvals)
+      </label>
+
+      <input type="hidden" name="quick_replies_json" :value="qrJson()" />
+      <input type="hidden" name="buttons_json" :value="btnJson()" />
+      <input type="hidden" name="ai_rephrase" :value="aiRephrase" />
+      <input type="hidden" name="requires_approval" :value="requiresApproval" />
+      <div class="row" style="gap:.5rem;align-self:flex-start">
+        <button class="btn btn-primary" type="submit">Create rule</button>
+        ${cancel ? html`<button class="btn btn-sm" type="button" hx-get="/rules/list" hx-target="#rules-list" hx-swap="innerHTML">Cancel</button>` : html``}
+      </div>
+    </form>`;
+}
+
+function loadApprovals(workspaceId: string) {
+  return db
+    .select({
+      id: pendingApprovals.id,
+      conversationId: pendingApprovals.conversation_id,
+      recipient: pendingApprovals.recipient_platform_id,
+      proposed: pendingApprovals.proposed_content,
+      created_at: pendingApprovals.created_at,
+      ruleName: autoReplyRules.name,
+      // Who the reply goes to + which channel + what they said — so the approver sees the full
+      // context (not a raw psid). leftJoins so a deleted contact/channel/conversation still renders.
+      contactName: contacts.display_name,
+      channelName: channels.display_name,
+      platform: channels.platform,
+      threadType: conversations.thread_type,
+      trigger: conversations.last_message_preview,
+    })
+    .from(pendingApprovals)
+    .leftJoin(autoReplyRules, eq(autoReplyRules.id, pendingApprovals.rule_id))
+    .leftJoin(contacts, eq(contacts.id, pendingApprovals.contact_id))
+    .leftJoin(channels, eq(channels.id, pendingApprovals.channel_id))
+    .leftJoin(conversations, eq(conversations.id, pendingApprovals.conversation_id))
+    .where(and(eq(pendingApprovals.workspace_id, workspaceId), eq(pendingApprovals.status, "pending")))
+    .orderBy(desc(pendingApprovals.created_at))
+    .limit(100);
+}
+
+/** Recently resolved (approved / rejected) approvals — the audit trail. Kept until maintenance prunes
+ *  resolved rows past the ledger window, so this shows what was sent vs discarded in the recent past. */
+function loadResolvedApprovals(workspaceId: string) {
+  return db
+    .select({
+      id: pendingApprovals.id,
+      status: pendingApprovals.status,
+      proposed: pendingApprovals.proposed_content,
+      resolved_at: pendingApprovals.resolved_at,
+      ruleName: autoReplyRules.name,
+      contactName: contacts.display_name,
+      recipient: pendingApprovals.recipient_platform_id,
+      threadType: conversations.thread_type,
+    })
+    .from(pendingApprovals)
+    .leftJoin(autoReplyRules, eq(autoReplyRules.id, pendingApprovals.rule_id))
+    .leftJoin(contacts, eq(contacts.id, pendingApprovals.contact_id))
+    .leftJoin(conversations, eq(conversations.id, pendingApprovals.conversation_id))
+    .where(and(eq(pendingApprovals.workspace_id, workspaceId), ne(pendingApprovals.status, "pending")))
+    .orderBy(desc(pendingApprovals.resolved_at))
+    .limit(25);
+}
+
+/** Load both queues + render — shared by the page and the approve/reject htmx swaps so a just-resolved
+ *  item drops straight into the history. */
+async function renderApprovalsView(workspaceId: string, error?: string): Promise<Html> {
+  const [pending, resolved] = await Promise.all([loadApprovals(workspaceId), loadResolvedApprovals(workspaceId)]);
+  return renderApprovals(pending, resolved, error);
+}
+
+function renderResolvedApprovals(list: Awaited<ReturnType<typeof loadResolvedApprovals>>): Html {
+  if (list.length === 0) return html``;
+  const snippet = (p: unknown) => {
+    const pc = p as { content?: { text?: string } | null; comment?: { text?: string } | null } | null;
+    return pc?.comment?.text ?? pc?.content?.text ?? "";
+  };
+  return html`<details class="appr-resolved">
+    <summary>Recently resolved (${list.length})</summary>
+    ${list.map((r) => {
+      const who = r.contactName ?? r.recipient;
+      const tone = r.status === "approved" ? "tone-ok" : "tone-bad";
+      const txt = snippet(r.proposed);
+      return html`<div class="appr-resolved-row">
+        <span class="badge ${tone}">${r.status === "approved" ? "Sent" : "Rejected"}</span>
+        <span>${who}</span>
+        ${txt ? html`<span class="appr-resolved-snippet">“${truncateCodePoints(txt, 60)}”</span>` : html``}
+        <span class="appr-resolved-time">${r.resolved_at ? timeAgo(r.resolved_at) : ""}</span>
+        <button class="btn btn-sm btn-ghost" type="button" title="Delete from history" hx-delete="/approvals/${r.id}" hx-target="#approvals-list" hx-swap="innerHTML" hx-confirm="Delete this from history?" data-confirm-label="Delete">${icon("close", "ico", 12)}</button>
+      </div>`;
+    })}
+  </details>`;
+}
+
+function renderApprovals(list: Awaited<ReturnType<typeof loadApprovals>>, resolved: Awaited<ReturnType<typeof loadResolvedApprovals>> = [], error?: string): Html {
+  const notice = error ? html`<div class="notice notice-err">${error}</div>` : html``;
+  if (list.length === 0) return html`${notice}<div class="empty"><span class="empty-ic">${icon("check", "ico", 20)}</span><p class="empty-title">Nothing waiting for approval</p><p class="empty-body">When a rule holds a reply for review, it shows up here.</p></div>${renderResolvedApprovals(resolved)}`;
+  return html`${notice}<div class="appr-list">${list.map((a) => {
+    const proposed = a.proposed as { content?: { text?: string; buttons?: unknown[]; quick_replies?: unknown[] } | null; comment?: { text?: string } | null } | null;
+    const content = proposed?.content ?? {};
+    const commentText = proposed?.comment?.text;
+    const dmText = content.text;
+    const nBtn = content.buttons?.length ?? 0;
+    const nQr = content.quick_replies?.length ?? 0;
+    const dmExtra = [nBtn ? `${nBtn} button${nBtn === 1 ? "" : "s"}` : null, nQr ? `${nQr} quick repl${nQr === 1 ? "y" : "ies"}` : null].filter(Boolean).join(" · ");
+    const who = a.contactName ?? a.recipient;
+    const channel = a.threadType === "comment" ? "comment" : "DM";
+    const meta = [a.channelName, channel, a.ruleName ?? "rule", timeAgo(a.created_at)].filter(Boolean).join(" · ");
+    // ADUX2: one edited text feeds whichever parts the parked reply has — same single-textarea
+    // semantics as the inbox thread's edit form (updateProposedText applies it to both).
+    const editPrefill = dmText ?? commentText ?? "";
+    return html`<div class="appr" x-data="{ editing: false }">
+      <div class="appr-top">
+        <div>
+          <div class="appr-who">${who}</div>
+          <div class="appr-meta">${meta} · <a href="/inbox?open=${a.conversationId}">open in inbox →</a></div>
+        </div>
+        <div class="appr-actions" x-show="!editing">
+          <button class="btn btn-sm btn-primary" hx-post="/approvals/${a.id}/approve" hx-target="#approvals-list" hx-swap="innerHTML">Approve</button>
+          <button class="btn btn-sm" type="button" @click="editing = true">Edit</button>
+          <button class="btn btn-sm btn-danger" hx-post="/approvals/${a.id}/reject" hx-target="#approvals-list" hx-swap="innerHTML">Reject</button>
+          <button class="btn btn-sm btn-danger" hx-delete="/approvals/${a.id}" hx-target="#approvals-list" hx-swap="innerHTML" hx-confirm="Delete this draft? It will be gone from Approvals and from the inbox." data-confirm-label="Delete">Delete</button>
+        </div>
+      </div>
+      ${a.trigger ? html`<blockquote class="appr-trigger">${a.trigger}</blockquote>` : html``}
+      <div class="appr-replies" x-show="!editing">
+        ${commentText ? html`<div class="appr-reply">
+          <div class="appr-reply-head"><span class="badge tone-info">Public comment</span></div>
+          <div class="appr-reply-text">${commentText}</div>
+        </div>` : html``}
+        ${dmText ? html`<div class="appr-reply">
+          <div class="appr-reply-head"><span class="badge tone-neutral">DM</span>${dmExtra ? html`<span class="appr-reply-extra">${dmExtra}</span>` : html``}</div>
+          <div class="appr-reply-text">${dmText}</div>
+        </div>` : (!commentText ? html`<div class="appr-reply"><div class="appr-reply-text is-empty">(no reply text)</div></div>` : html``)}
+      </div>
+      <form class="draft-edit" x-show="editing" x-cloak hx-post="/approvals/${a.id}/edit" hx-ext="json-enc" hx-target="#approvals-list" hx-swap="innerHTML">
+        <textarea class="textarea" name="text" rows="3" required x-ref="ta">${editPrefill}</textarea>
+        <div class="draft-actions">
+          <button class="btn btn-sm btn-primary" type="submit">Save</button>
+          <button class="btn btn-sm" type="button" @click="editing = false; $refs.ta.value = $refs.ta.defaultValue">Cancel</button>
+        </div>
+      </form>
+    </div>`;
+  })}</div>${renderResolvedApprovals(resolved)}`;
+}
+
+async function loadSequences(workspaceId: string) {
+  const rows = await db.query.sequences.findMany({
+    where: eq(sequencesTbl.workspace_id, workspaceId),
+    orderBy: desc(sequencesTbl.created_at),
+    columns: { id: true, name: true, status: true, steps: true },
+  });
+  // One grouped enrollment count for all sequences instead of a $count per sequence.
+  const ids = rows.map((r) => r.id);
+  const counts = ids.length
+    ? await db
+        .select({ sequence_id: sequenceEnrollments.sequence_id, n: count() })
+        .from(sequenceEnrollments)
+        .where(inArray(sequenceEnrollments.sequence_id, ids))
+        .groupBy(sequenceEnrollments.sequence_id)
+    : [];
+  const bySeq = new Map(counts.map((c) => [c.sequence_id, Number(c.n)]));
+  return rows.map((seq) => ({ ...seq, _count: { enrollments: bySeq.get(seq.id) ?? 0 } }));
+}
+
+function renderSequences(seqs: Awaited<ReturnType<typeof loadSequences>>, error?: string): Html {
+  const notice = error ? html`<div class="notice notice-err">${error}</div>` : html``;
+  if (seqs.length === 0) return html`${notice}<div class="empty"><span class="empty-ic">${icon("reopen", "ico", 20)}</span><p class="empty-title">No sequences yet</p><p class="empty-body">Create a drip sequence above to nurture contacts over time.</p></div>`;
+  const seqTone = (s: string): Tone => (s === "active" ? "ok" : s === "draft" ? "info" : "neutral");
+  return html`${notice}<div class="table-wrap"><table>
+    <thead><tr><th>Sequence</th><th>Status</th><th>Steps</th><th>Enrolled</th><th class="th-act">Actions</th></tr></thead>
+    <tbody>${seqs.map((seq) => {
+      const stepCount = Array.isArray(seq.steps) ? seq.steps.length : 0;
+      return html`<tr>
+        <td><span style="font-weight:600;color:var(--text-1)">${seq.name}</span></td>
+        <td><span class="badge tone-${seqTone(seq.status)}">${seq.status}</span></td>
+        <td><span class="muted-mono">${stepCount}</span></td>
+        <td><span class="muted-mono">${seq._count.enrollments}</span></td>
+        <td class="th-act"><div class="wh-actions" style="justify-content:flex-end">
+          ${seq.status === "draft" ? html`<button class="btn btn-sm" hx-post="/sequences/${seq.id}/status" hx-ext="json-enc" hx-vals='{"status":"active"}' hx-target="#sequences-list" hx-swap="innerHTML">Activate</button>` : html``}
+          ${seq.status === "active" ? html`<button class="btn btn-sm" hx-post="/sequences/${seq.id}/status" hx-ext="json-enc" hx-vals='{"status":"archived"}' hx-target="#sequences-list" hx-swap="innerHTML">Archive</button>` : html``}
+          ${seq.status === "archived" ? html`<button class="btn btn-sm" hx-post="/sequences/${seq.id}/status" hx-ext="json-enc" hx-vals='{"status":"active"}' hx-target="#sequences-list" hx-swap="innerHTML">Restore</button>` : html``}
+          <button class="btn btn-sm btn-danger" hx-delete="/sequences/${seq.id}" hx-target="#sequences-list" hx-swap="innerHTML" hx-confirm="Delete this sequence?">Delete</button>
+        </div></td>
+      </tr>`;
+    })}</tbody></table></div>`;
+}

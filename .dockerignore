@@ -1,0 +1,24 @@
+.git
+.gitignore
+.next
+node_modules
+npm-debug.log
+.env
+.env.local
+.env.production
+README.md
+CONTRIBUTING.md
+CHANGELOG.md
+SECURITY.md
+.github/
+docker/*
+# …but the worker image COPYs its liveness probe from here, so re-include just that file.
+!docker/worker-healthcheck.sh
+*.md
+coverage/
+.turbo/
+.worktrees/
+# Landing build artifacts/deps — the landing Docker stage runs npm ci + build fresh.
+landing/node_modules
+landing/dist
+landing/.astro

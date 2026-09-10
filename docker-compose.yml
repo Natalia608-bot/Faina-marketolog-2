@@ -1,0 +1,84 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-replystack}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-replystack-dev}
+      POSTGRES_DB: ${POSTGRES_DB:-replystack}
+    ports:
+      - "${PG_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-replystack}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # --- App (full stack, builds locally) ---
+  # Start everything: docker compose up
+  # Start only the DB for local dev: docker compose up postgres
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    profiles: ["app"]
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    env_file: .env
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-replystack}:${POSTGRES_PASSWORD:-replystack-dev}@postgres:5432/${POSTGRES_DB:-replystack}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 30s
+      timeout: 10s
+      start_period: 30s
+      retries: 3
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.worker
+    profiles: ["app"]
+    env_file: .env
+    environment:
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-replystack}:${POSTGRES_PASSWORD:-replystack-dev}@postgres:5432/${POSTGRES_DB:-replystack}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # web migrates the DB in its entrypoint before serving; gate the worker on web being healthy
+      # so it never pulls a job against a not-yet-migrated schema on a rolling restart.
+      web:
+        condition: service_healthy
+    restart: unless-stopped
+    # A hung worker stays "running" but stops polling; the heartbeat probe makes that visible.
+    healthcheck:
+      test: ["CMD", "sh", "/app/docker/worker-healthcheck.sh"]
+      interval: 15s
+      timeout: 5s
+      start_period: 40s
+      retries: 3
+
+  # Optional: NocoDB spreadsheet view of your data
+  # Access at http://localhost:8080
+  nocodb:
+    image: nocodb/nocodb:latest
+    profiles: ["nocodb"]
+    ports:
+      - "8080:8080"
+    environment:
+      NC_DB: "pg://${POSTGRES_HOST:-postgres}:5432?u=${POSTGRES_USER:-replystack}&p=${POSTGRES_PASSWORD:-replystack-dev}&d=${POSTGRES_DB:-replystack}"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - nocodb_data:/usr/app/data
+
+volumes:
+  postgres_data:
+  nocodb_data:

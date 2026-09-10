@@ -1,0 +1,19 @@
+repos:
+  - repo: https://github.com/trufflesecurity/trufflehog
+    rev: v3.88.24
+    hooks:
+      - id: trufflehog
+        name: TruffleHog secret scan
+        entry: trufflehog git file://. --since-commit HEAD --results verified,unknown --fail
+        language: golang
+        pass_filenames: false
+        stages: [pre-commit]
+
+  - repo: local
+    hooks:
+      - id: lint-typecheck-test
+        name: Lint + Typecheck + Test
+        entry: bash -c 'cd "$(git rev-parse --show-toplevel)" && npm run lint && npm run typecheck && npm test'
+        language: system
+        pass_filenames: false
+        stages: [pre-push]

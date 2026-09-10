@@ -1,0 +1,119 @@
+import { and, eq } from "drizzle-orm";
+import { authenticateWithScope } from "@/lib/auth";
+import { db } from "@/lib/db";
+import { conversations, workspaceMembers } from "@/db/schema";
+import { ok, ApiErrors } from "@/lib/api/response";
+import { proGate } from "@/lib/api/pro-gate";
+import { resumeDueEnrollments } from "@/lib/sequences/resume";
+import { z } from "zod";
+
+export const runtime = "nodejs";
+
+// GET /api/v1/conversations/:id
+export async function GET(
+  request: Request,
+  { params }: { params: Promise<{ conversationId: string }> }
+) {
+  const auth = await authenticateWithScope(request, "conversations:read").catch(() => null);
+  if (!auth) return ApiErrors.unauthorized();
+  const gate = await proGate("contacts_crm");
+  if (gate) return gate;
+
+  const { conversationId } = await params;
+  const conversation = await db.query.conversations.findFirst({
+    where: and(eq(conversations.id, conversationId), eq(conversations.workspace_id, auth.workspaceId)),
+    columns: {
+      id: true,
+      platform: true,
+      status: true,
+      last_message_at: true,
+      unread_count: true,
+      is_automation_paused: true,
+      // Projected so an API consumer can READ the assignment it set via PATCH.
+      assigned_to: true,
+    },
+    with: {
+      channel: { columns: { id: true, display_name: true, platform: true } },
+      contact: {
+        columns: { id: true, display_name: true, avatar_url: true },
+        with: { contact_channels: { columns: { platform_sender_id: true, platform_username: true }, limit: 1 } },
+      },
+    },
+  });
+
+  if (!conversation) return ApiErrors.notFound();
+  return ok(conversation);
+}
+
+const patchSchema = z.object({
+  status: z.enum(["open", "closed", "snoozed"]).optional(),
+  is_automation_paused: z.boolean().optional(),
+  unread_count: z.literal(0).optional(),
+  assigned_to: z.string().uuid().nullable().optional(),
+});
+
+// PATCH /api/v1/conversations/:id
+export async function PATCH(
+  request: Request,
+  { params }: { params: Promise<{ conversationId: string }> }
+) {
+  const auth = await authenticateWithScope(request, "conversations:write").catch(() => null);
+  if (!auth) return ApiErrors.unauthorized();
+  const gate = await proGate("contacts_crm");
+  if (gate) return gate;
+
+  const { conversationId } = await params;
+  const existing = await db.query.conversations.findFirst({
+    where: and(eq(conversations.id, conversationId), eq(conversations.workspace_id, auth.workspaceId)),
+    columns: { id: true, is_automation_paused: true, contact_id: true, channel_id: true },
+  });
+  if (!existing) return ApiErrors.notFound();
+
+  const body = await request.json().catch(() => ({}));
+  const parsed = patchSchema.safeParse(body);
+  if (!parsed.success) {
+    return ApiErrors.validationError(parsed.error);
+  }
+  // An empty body (or unknown-keys-only, which zod strips to {}) would reach `.set({})` →
+  // Drizzle "No values to set" → 500. Return a 422 validation error (ApiErrors.validationError),
+  // consistent with how this endpoint already reports a bad body. NOTE: the contacts
+  // PATCH deliberately differs — it 200-no-ops on an empty body because a tag-ids-only PATCH is a
+  // legitimate no-row-change; these endpoints have no such secondary field, so an empty body is a
+  // genuine client error.
+  if (Object.keys(parsed.data).length === 0) {
+    return ApiErrors.validationError([{ path: "", message: "No fields to update" }]);
+  }
+
+  // assigned_to references users globally; only allow assigning to a member of THIS workspace
+  // (a cross-workspace user id would be a misleading dangling reference).
+  if (parsed.data.assigned_to) {
+    const member = await db.query.workspaceMembers.findFirst({
+      where: and(eq(workspaceMembers.workspace_id, auth.workspaceId), eq(workspaceMembers.user_id, parsed.data.assigned_to)),
+      columns: { user_id: true },
+    });
+    if (!member) return ApiErrors.validationError([{ path: "assigned_to", message: "User is not a member of this workspace" }]);
+  }
+
+  const updated = await db.transaction(async (tx) => {
+    const [row] = await tx
+      .update(conversations)
+      .set(parsed.data)
+      // Scope the write by workspace too (consistent with DELETE), not just the prior findFirst.
+      .where(and(eq(conversations.id, conversationId), eq(conversations.workspace_id, auth.workspaceId)))
+      .returning({
+        id: conversations.id,
+        status: conversations.status,
+        unread_count: conversations.unread_count,
+        is_automation_paused: conversations.is_automation_paused,
+        assigned_to: conversations.assigned_to,
+      });
+    // Un-pausing automation resumes any drip step that was deferred while this conversation was
+    // paused, in the same transaction, instead of waiting for the 30-min poll.
+    if (parsed.data.is_automation_paused === false && existing.is_automation_paused === true) {
+      await resumeDueEnrollments(tx, { channelId: existing.channel_id, contactId: existing.contact_id });
+    }
+    return row;
+  });
+
+  return ok(updated);
+}

@@ -1,0 +1,437 @@
+# Changelog
+
+All notable changes to PostStack will be documented here.
+
+Format: [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)
+Versioning: [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+
+---
+
+## [Unreleased]
+
+### Changed
+- **Publishing API keys now use separate read/write permissions.** Editorial content requires `content:read` / `content:write`, posts and scheduling require `posts:read` / `posts:write`, brands require `brands:read` / `brands:write`, and direct media registration requires `media:write`. Full-access keys continue to work. After upgrading, reissue existing keys with an explicit permission list before their integration makes its next publishing request.
+- **New API keys now require an explicit permission set.** The dashboard groups permissions by capability and adds read-only, publishing, inbox/automation, select-all and deselect-all controls. New keys cannot be created with an omitted, empty or duplicate permission list; existing keys remain unchanged.
+- **Interactive channel connections now require a logged-in dashboard session.** API keys continue to authenticate `/api/v1` integrations but cannot start or complete browser OAuth flows. Dashboard connect/reconnect links and provider callback URLs are unchanged.
+- **Runtime and build dependencies were updated to current supported releases.** Local Node.js tooling now requires Node 22.12 or newer, matching the production image and CI environment.
+- **Release verification is stricter.** Dependency and registry-signature checks are blocking, browser tests run in CI and release verification, third-party actions and runtime base images are pinned, and worker liveness remains accurate during long-running jobs.
+
+## [0.13.1] - 2026-08-01
+
+### Added
+- **AI-disclosure controls in the dashboard.** The brand's default AI declaration is now set on the Brands page (level + the wording that goes into the caption), and a per-channel override lives on the channel detail page for the case where one platform's output differs from the rest of the brand's. Previously these were reachable only over the API (brands) or in the database (channels), which made a legally load-bearing feature effectively unavailable in normal use. The note field appears only once a level is chosen and previews the built-in wording for that level; leaving it blank uses that wording rather than suppressing the line. **Not license-gated** — this is a compliance control, not a premium feature.
+
+## [0.13.0] - 2026-07-31
+
+### Added
+- **AI-content disclosure per post (EU AI Act Art. 50).** A post can now declare how much AI is in it — `none`, `ai_assisted` (AI used in production, nothing that realistically depicts a real person/event/place) or `ai_generated` (realistic AI-generated or AI-altered depiction) — and PostStack turns that declaration into each platform's own disclosure flag at publish time: YouTube `status.containsSyntheticMedia`, Instagram `is_ai_generated`, TikTok `post_info.is_aigc`, X `made_with_ai`. Three levels rather than a checkbox because the platforms don't mean the same thing: YouTube's flag is scoped to realistic synthetic content and it states production assistance needs no disclosure, while Instagram's is a broad self-disclosure of AI usage — so `ai_assisted` discloses everywhere except YouTube. Facebook Pages, Threads and LinkedIn expose no disclosure field at all, which is why a post can also carry a visible in-content disclosure line placed at the start of its caption — ahead of the text, because Instagram and TikTok collapse long captions behind a "more" tap and a label has to be perceivable without interaction (with a built-in default per level; an empty note explicitly suppresses it) — on those three platforms that line is the only disclosure that reaches the audience, and it travels with the content rather than depending on a platform rendering a badge. Every publish records what actually went out — level, platform, the vendor field name, the value, why, the note text and a timestamp — on the post itself, because terminal delivery-ledger rows are pruned after 90 days and so cannot serve as evidence. A post's level is nullable: unset ("nobody said", which is what every pre-existing post holds) is kept distinct from an explicit `none` ("the operator declared there is no AI"), though both send nothing today.
+- **Brand- and channel-level disclosure defaults.** A declaration resolves most-specific-first — **post → channel → brand** — because one piece of material usually goes out to every channel of a brand, so the brand is the natural place to set it once. The level and the note resolve independently, which is what makes the everyday case work: the brand holds one standard disclosure line and individual posts only say "this one is AI". An explicit `none` on a post switches a brand-wide declaration off for that post alone; an empty note deliberately suppresses the line and does not fall through to a broader layer's wording. Where each half came from is recorded alongside the publish, so the audit trail answers "why did this post disclose?" — often "because the brand says so" rather than anything on the post. Settable via `POST`/`PATCH /brands` (`default_ai_disclosure`, `default_ai_disclosure_note`; null clears). No dashboard UI yet, and channel-level defaults are currently settable only in the database.
+- **YouTube publish options over the API.** `POST /posts` / `PATCH /posts/{id}` now accept `youtubePrivacy` (`private` / `unlisted` / `public`), `youtubeTags`, `youtubeCategoryId` and `youtubeMadeForKids`, and `POST /posts/{id}/publish` passes them through. Previously **every** video published through the API landed on YouTube as Private with no way to change it: the provider had always read these options, but nothing in the public API could set them. Leaving the new fields unset reproduces the old behaviour exactly, so no existing post changes visibility.
+- **`GET /brands/{brandKey}/channels`** — resolves which channel a brand publishes to on each editorial platform (`{ platform, channel, ambiguous }`). An agent needs this before publishing; `GET /channels` doesn't expose `brand_key`, so callers previously could only filter by platform and guess. An unregistered brand returns 404 and an ambiguous mapping returns `channel: null` with `ambiguous: true` — resolution never guesses.
+
+### Fixed
+- **The documented API-key prefix was wrong** (`rs_live_`, the pre-rename value) in AGENTS.md, a maintenance script, and — the one that actually cost people time — the live Settings → API Keys panel, which told users to authenticate with a prefix that 401s. The panel now interpolates the real prefix from `BRAND.idPrefix`, so it cannot drift again.
+
+## [0.12.0] - 2026-07-19
+
+### Added
+- **AI provider fallback chain (resilience + cost tiers).** The AI client can now be given an ordered list of backup providers via a new `AI_FALLBACKS` setting (JSON array of `{ apiKey, model, baseUrl? }`). `chatComplete` walks the chain — the primary (`AI_API_KEY`/`AI_BASE_URL`/`AI_MODEL`) first, then each fallback — and the first provider to return a usable completion wins. It falls through on **any** failure (non-2xx of any status, a thrown/timed-out request, or an empty/malformed completion), regardless of cause, so a reply keeps generating as long as one provider is healthy — and so you can run a free/cheap primary that automatically falls back to a paid one during an outage or once a rate-limit is exhausted. Each provider's request is built for its own model (GPT-5/o-series reasoning params respected per model), and every attempt is logged with its model + failure reason so a fallthrough is fully visible in the AI generation log. A fallback-only setup (no primary key) is valid; a malformed `AI_FALLBACKS` is ignored and never breaks the primary. Backward compatible: with no `AI_FALLBACKS` the behaviour is identical to before. Applies to both AI-drafted replies and AI rephrasing.
+
+## [0.11.1] - 2026-07-19
+
+### Fixed
+- **AI drafting now works with OpenAI's GPT-5 and o-series models.** Those "reasoning" models renamed `max_tokens` → `max_completion_tokens` and reject any non-default `temperature`, so the shared chat client's classic `max_tokens` + `temperature` request returned HTTP 400 and produced no draft. The client now detects GPT-5/o-series models by name and sends `max_completion_tokens` with temperature omitted, while every other model (gpt-4o, and non-OpenAI providers via `AI_BASE_URL` — Groq/Ollama/OpenRouter/Claude proxy) keeps the shape it already accepts. Set `AI_MODEL` to e.g. `gpt-5.6-terra` to use it.
+
+## [0.11.0] - 2026-07-19
+
+### Added
+- **Duplicate an auto-reply rule.** Each rule in the list has a **Duplicate** action that opens the Create form pre-filled with the source rule's settings (name suffixed " (copy)", trigger, keywords, response text, buttons, quick replies, approval flag). It POSTs as a brand-new rule on submit — the original is never touched — so a proven rule can be cloned and tweaked instead of rebuilt from scratch.
+
+### Fixed
+- **The hourly Meta health sweep no longer latches a channel to `needs_reauth` on a transient blip.** It used to only ever *trip* the breaker: a single transient `is_valid:false` from Meta's `debug_token` flagged a channel `needs_reauth` with no confirmation — and since `needs_reauth` channels were excluded from the sweep and derived Facebook/Instagram channels have no OAuth refresh path, a perfectly valid channel could never recover on its own. The sweep now reconciles in **both** directions, mirroring the on-demand health check: it still trips a healthy channel on a confirmed-bad token, and **self-heals** a `needs_reauth` channel the moment `debug_token` re-confirms the same stored token is valid. Recovery fires only on a positive re-confirmation, never on a transient/inconclusive check, so an unattended loop never flaps. `sweepChannelHealth` now also reports `recovered`.
+
+### Changed
+- **The overview "Needs attention" rows now show the platform** (brand icon + label) and the whole row is a **click-through to the channel's detail page** (`/channels/{id}`), so a broken channel is identifiable and reachable in one click. The Reconnect action is unchanged (derived channels still route to `/sources`).
+
+## [0.10.0] - 2026-07-04
+
+### Added
+- **Direct-OAuth publishing for LinkedIn, X (Twitter) and Threads** (plus TikTok), alongside the existing Meta/YouTube flows. The Channels and Settings → Integrations pages now show **Connect** buttons and the exact **redirect/callback URIs** for every direct-OAuth publisher, so an account can be connected without leaving the app. Publishing itself now supports **text-only posts** (LinkedIn / X / Threads) and **LinkedIn image & video** uploads via the LinkedIn Assets API. `GET /api/v1/channels` exposes **`can_publish`** per channel so an API client can tell an inbox-only channel (e.g. Telegram) from a publishable one.
+- **Self-healing reconnects.** Reconnecting a channel now auto-removes the stale pre-migration row it supersedes: a channel keyed by a vanity handle instead of the provider's API id can't publish and is flagged `needs_reauth`; the reconnect mints a correct row and **soft-deletes the handle-keyed orphan** for the same account (X, Threads, YouTube — matched on the platform-unique @handle, scoped to `needs_reauth` rows only, never touching a live channel).
+- **Final re-auth reminder.** In addition to the one alert sent when a channel first flips `needs_reauth` (~7 days before a token expires), a second **higher-priority** `channel_reauth_urgent` alert now goes out ~24h before the token hard-expires if the channel still hasn't been reconnected — sent **once per expiry** (self-resetting after a reconnect), so a slow reconnect can't silently lose the channel. Especially relevant for LinkedIn, whose token can't be refreshed programmatically and requires a manual reconnect.
+- **Post-level `title`** is reachable through the posts API, enabling **YouTube publishing** via the API (title is required there).
+
+### Changed
+- **X/Twitter is keyed consistently as the `twitter` platform** across the publish path and the OAuth connect flow (the publish provider is `x`, aliased both ways), fixing X connect and media-format resolution.
+- **OAuth connect-callback failures are now logged** with context instead of being silently swallowed behind a generic `?error=` redirect, making a failed connect diagnosable.
+
+### Fixed
+- **Publishing:** text-only posts are no longer rejected for "no media"; **X media publish now fails loud** instead of silently posting text and dropping the media; blank `video_url` no longer poisons media-URL resolution (`videoUrl:""` masking a real `media_url`).
+- **Events:** `post.*` lifecycle events are keyed to the editorial post id, not the delivery id.
+- **Contacts:** `contact.updated` is emitted on API / import updates.
+- **Inbox:** the conversation-row click spinner no longer reflows the row, and the unread dot no longer overlaps the timestamp.
+- **Docs/license:** corrected the `webhook_filtering` feature description.
+
+### Migrations
+- `0005_post_title.sql` — adds the post-level `title` column (forward-only, snapshot without drift).
+
+## [0.9.0] - 2026-07-01
+
+### Security
+- **Webhook delivery is now secure-by-default.** The SSRF / URL-safety checks are consolidated into one rebinding-safe HTTP client (DNS-resolved, connect-time IP-pinned, TLS-SNI-preserving) shared by media fetching and webhook delivery. Webhook delivery — the channel-alert hook **and** outbound webhooks — now blocks private/loopback/LAN targets by default; set `WEBHOOK_ALLOW_PRIVATE_TARGETS=true` to opt in for an internal receiver (e.g. an n8n/ntfy on the same Docker network or LAN). Cloud-metadata and link-local addresses are **always** blocked. **Behavior change:** an existing channel-alert webhook pointing at an internal/private address now needs this flag set.
+- **Endpoint-create-time rejection of literal cloud-metadata / link-local targets**, and defence-in-depth neutralization of HTML metacharacters in webhook diagnostic fields.
+
+### Added
+- **AI-drafted replies (PRO).** Per channel, two independent toggles turn on AI drafting for **direct messages** and for **public comments** — a comment with only the DM one on replies **privately** (the "comment a keyword, get the link on DM" pattern), only the public one on replies publicly, and both on replies both ways; a genuine DM only ever consults the DM toggle, so it's never drafted (and never billed to the LLM) when only public replies are configured. When no auto-reply rule matches an eligible inbound and AI-draft is on for that surface, an LLM prepares a **draft** reply for human approval — plus an on-demand **"Generate reply"** button in the inbox. Drafts are reviewed, edited, accepted, rejected, or deleted entirely straight in the inbox thread (and the Approvals tab, which also gained inline editing); rule-based **"hold for approval"** replies now surface in the inbox too. A drafted reply appears automatically once the LLM finishes (a self-terminating poll with a "generating…" spinner) — no manual refresh, including when a second draft is requested while an earlier one is still awaiting review. **Never auto-sent by default** — optional per-channel auto-send toggles (DM / public, default off, consent-gated). The prompt sees the parent post's caption (resolved locally, or fetched live from the platform for a post published outside PostStack) plus the recent conversation history, and clearly labels what's the caption, what's the incoming message (public comment vs. DM), and which surface the reply is for — identically whether triggered automatically or on demand. Reuses the existing AI provider config (`AI_API_KEY` / `AI_MODEL` / `AI_BASE_URL`, **BYOK**); per-workspace daily budget via `AI_DRAFT_DAILY_LIMIT` (default `0` = unlimited). The prompt override (workspace default + per-channel) is **split into a DM and a public-comment variant**, so each surface can have its own persona/tone. Schema ships inside migration `0004`; existing prod instances apply the idempotent delta scripts under `priv/deploy/` once at deploy (see docs/DEPLOY.md §2.4).
+- **AI generation log (PRO).** Settings → Automation now lists recent AI generations (drafts and rephrases) — the exact prompt sent and the exact response (or failure reason) received, each linking straight to the inbox conversation it was generated for.
+- **Instagram Business Login** — connect a single Instagram account **directly** (no Facebook page required) via the new **"+ Instagram (messaging)"** button on the Channels page. One account, full capabilities at Meta **Standard Access** (no App Review): publishing, comments, **direct messages**, and follow-gate. Configured per instance with `INSTAGRAM_APP_ID` / `INSTAGRAM_APP_SECRET` (the **Instagram** app's id/secret — distinct from the Facebook app's `META_APP_ID`/`META_APP_SECRET`). Includes: dual-secret webhook verification (the Meta webhook now verifies signatures from **either** the Facebook or the Instagram app secret), per-account webhook subscription, an in-panel **"Connecting Instagram"** guide with per-channel capability notes, and IG-Login-aware reconnect plus a webhook-subscription panel. PRO features (follow-gate, sequences, manual replies, …) still require a PRO license regardless of how the account is connected.
+- **Outbound webhooks management UI** — a dashboard section to manage multiple endpoints: list / add / edit / enable-disable / rotate signing secret / delete, each with its own per-event subscription, per-endpoint **custom headers** (encrypted at rest, e.g. an `Authorization` token for the receiver) and **extra payload fields** merged into every delivered body (with `{{id}} {{type}} {{created_at}}` placeholder support) — the same customization the alert webhook already had. Both are also settable via the `/api/v1/webhooks` API (`headers` on create/PATCH; `header_names` + `extra_payload_fields` on read).
+- **Webhook observability.** Every signature-verified payload that hits the Meta endpoint is now durably logged and inspectable — including ones with no classifiable event and the Meta dashboard **"Test"** button. The Webhooks page surfaces an **"Unhandled event types"** panel so genuinely-unrouted inbound shapes are visible instead of silently dropped. The GET handshake and each POST refused before classification (bad signature, too large, unparseable, unknown object) also leave a throttled trace.
+- **Instagram `live_comments`** are handled → routed into the comment pipeline with per-account auto-subscribe (previously dropped).
+- **Configurable AI rephrase prompt** — a workspace-default rephrase prompt plus a per-rule Tone + Custom-prompt override, with the built-in default shown everywhere it can be overridden.
+- **Rich inbox rendering** — incoming message attachments / buttons / quick-replies render as real content instead of an opaque "(attachment)", and outbound interactive content is persisted.
+- **AI availability is surfaced end-to-end.** With no AI provider key set, the inbox "Generate reply" buttons are disabled with a notice, the Settings AI-draft / rephrase prompt forms, the per-channel AI-drafted-replies panel, and the rule "Rephrase with AI" fields all show a "no provider configured" banner, and the on-demand draft endpoint refuses with a clear message instead of silently promising a draft that never appears. The API exposes **`ai_configured`** on `GET /api/v1/license` so agents / automations can check it (together with the `ai_draft` / `rephrase` PRO features) before relying on AI.
+
+### Changed
+- **Recognized Facebook `feed` noise is logged as `ignored`, not `unhandled`.** The Page editing its own content (video / post / status lifecycle), reactions on comments, and comment edits/removes are still durably recorded but kept out of the "Unhandled event types" surface, so that panel stays focused on genuinely-unrouted shapes.
+- **Telemetry phone-home is suppressed for the whole loopback + private / LAN / CGNAT / link-local range**, not just `127.0.0.1` — local and internal deployments never emit a usage report.
+
+### Fixed
+- **Landing:** root image assets (hero / showcase) 404 fixed (extension-guarded asset route); the publish animation is data-driven off the real channel list; roadmap lanes corrected.
+- **Media fetch** routed through the shared rebinding-safe pinned client (SSRF parity now includes media), with streaming restored — no whole-video buffering and no 15s cap on large uploads.
+- **Instagram Business Login hardening** (audit pass): preserve the IG-Login messaging token on a Facebook-side channel upsert and on token refresh; race-safe token-refresh writes; redact secrets before persisting re-auth reasons / `last_error`; truthful per-channel subscription health (no "active, receiving nothing"); correct `message_reactions` field name; IG-Login-only comments/permalink routed to `graph.instagram.com`.
+- **Publishing:** IG feed images send `image_url` (not a bare `url`); a benign Meta 400 no longer flags a channel `needs_reauth`.
+- **Queue:** a **held** post can now be cancelled (not only a scheduled one).
+- **Inbox:** the on-demand **"Generate reply"** button returned "Nothing to reply to yet" on every comment thread — it read the inbound text from the DM store (`messages`) instead of the comment store (`commentLogs`), so it had nothing to work with on the exact case (public/first-touch comment replies) it's most useful for.
+
+## [0.8.6] - 2026-06-28
+
+### Added
+- **Lead capture** — capture an email or phone number from a Meta `user_email` / `user_phone_number` quick-reply reply straight onto the contact in your CRM (new `contacts.phone`, per-conversation `awaiting_capture` state), and fire a signed outbound webhook the moment it's captured. New "Lead capture" section on the landing page.
+- **Admin panel redesign** — whole-panel visual + UX rework on the existing Hono/HTMX/Alpine stack (no SPA rewrite): a first-class **light mode** (topbar toggle, cookie-persisted, no-FOUC), self-hosted **Geist / Geist Mono** fonts, redesigned compose / inbox / channels / content / queue / contacts / dashboard screens, unified design tokens and an SVG icon sprite, and branded 404/500 pages.
+- **Inbox status triage** — Open/Done states with a contact filter chip; comment threads now show the resolved post title instead of the raw post id.
+- **Landing visuals** — AI-generated hero / showcase / Open Graph imagery plus scroll-driven section ambience and an igniting "how it works" stepper.
+
+### Changed
+- **Telemetry is now fully anonymous.** The opt-out usage report no longer carries any hashed identifier (dropped `domain_hash` and `license_hash`) and coarsens high-entropy host facts into buckets (`cpu_bucket`, `mem_bucket`, `runtime_version_major`; `node_env` removed) — the only remaining identity is the random instance id and the license tier. Receiver-side dedup is now driven by a persisted per-report `report_id` with an atomic claim-then-confirm send gate. See the privacy page for exactly what is shared.
+
+### Fixed
+- Telemetry: a brand-new instance's first report now sends reliably (the send gate seeds its `telemetry_state` singleton before claiming, instead of assuming the row exists).
+
+## [0.8.5] - 2026-06-26
+
+### Fixed
+- The in-app **"requires PRO" / upgrade** links pointed at a product slug that returned 404; they now link to the live plans page (`/v/poststack-plans`).
+
+### Changed
+- Landing page and README now make explicit that running PostStack on **your own** accounts needs **no verified/approved Meta app** and no Google/Telegram identity verification — only standard developer-app configuration. Added a Meta **access-levels** reference (what needs App Review and what doesn't), a one-token **System User** setup guide, and a note that the Meta app must be in **Live** mode (a toggle, not a review) for production webhooks.
+
+## [0.8.4] - 2026-06-26
+
+### Added
+- **Outbound webhooks** — subscribe an external URL to workspace events and receive a signed POST when they happen. HMAC-SHA256 signatures (`t=…,v1=…` over `timestamp.body`) with dual-secret rotation, idempotent fan-out, automatic retry with dead-lettering, and an SSRF-guarded dispatcher. Managed via `/api/v1/webhooks` (CRUD + `rotate-secret`). Requires a PRO license.
+- **Bulk contacts create/import** via the API, plus migration guides for moving an existing contact base in.
+- **Rule action `add_tags`** — auto-tag a contact when an inbound message matches a rule.
+- **Tag edit & delete** via `PATCH`/`DELETE /api/v1/tags/{id}`, completing tag CRUD.
+- `contact.created` event, emitted when a new contact is first resolved or imported.
+
+### Changed
+- **Unified API error contract** across all `/api/v1` endpoints: `error.code` is now lowercase snake_case; `validation_error` carries `details: [{ path, message }]`; `pro_required` carries `{ feature, upgrade_url }`. List pagination meta is `{ has_more, next_cursor }`.
+
+## [0.8.3] - 2026-06-25
+
+### Changed
+- Landing page now distinguishes **messaging channels** (Facebook, Instagram, YouTube, Telegram, Gmail — full inbox + auto-reply) from **publishing channels** (TikTok, X, LinkedIn, Threads — schedule & post only). Previously the latter were shown as "more coming", implying inbox support that those platforms' APIs do not allow. Roadmap and FAQ reworded to match; the genuinely-upcoming messaging channels are WhatsApp, Email (IMAP/SMTP), SMS and Discord.
+
+## [0.8.2] - 2026-06-25
+
+### Changed
+- Anonymous telemetry is no longer sent from a non-deployment host (localhost, loopback, `0.0.0.0`, `*.local`). Only a real deployment domain reports in, so the public fleet's instance count isn't inflated by local development, CI or test runs. A genuine self-host on a domain is unaffected.
+
+### Dependencies
+- Bumped hono 4.12.27, sharp 0.35.2, dotenv 17.4.2, @types/node, typescript-eslint, actions/checkout v7, trufflehog 3.95.6.
+
+## [0.8.1] - 2026-06-25
+
+### Fixed
+- Telegram inbound now sets the contact's display name from the sender's name (carried inline in the webhook), instead of leaving a brand-new Telegram contact showing as a bare chat id.
+
+### Changed
+- Fleet-stats card relabelled to **Avg. auto-reply time** — the metric measures the time from an inbound message to a rule/sequence auto-reply being sent (it is never set by a human reply), so the label now says what it is.
+
+## [0.8.0] - 2026-06-24
+
+### Added
+- **Gmail channel** — connect a Gmail mailbox as a two-way reply/inbox channel. Filtered ingest via a per-mailbox Gmail search query (labels, `from:`, `subject:`, …; default `in:inbox`), unified inbox showing the email subject + sender, threaded replies, and the full auto-reply rules + approval workflow. Read-only on the mailbox (OAuth scopes `gmail.readonly` + `gmail.send`); ingested by a cron poller, forward-only on connect (no inbox backfill). See README → Gmail Setup.
+- Pluggable `EmailProvider` base class so further mailbox providers (IMAP/SMTP, Outlook, …) can be added as a single provider class. See `docs/ADDING_A_MAILBOX_PROVIDER.md`.
+
+### Changed
+- Inbox conversation list now shows the email subject for email threads.
+- Telemetry's configured-platforms list is registry-driven — newly added channels self-register without touching the collector.
+- On-demand OAuth token refresh now also runs inside the email poll (shared with the send path), and a refreshed token's new expiry is surfaced on the channel.
+
+## [0.7.11] - 2026-06-22
+
+### Fixed
+
+- **Webhook subscriptions panel no longer flags a Facebook page as permanently “Missing 1 field(s).”** The required Facebook page-field set listed `messaging_optins`, but PostStack has no handler for opt-in events and Meta doesn’t durably keep that field in a page’s subscription — so clicking “Fix” cleared the warning only until the next live check, when it returned. The required set now contains only the fields PostStack actually consumes (matching the Instagram set), so the subscription health check is accurate and the warning stays cleared. Regression tests assert `messaging_optins` is neither required nor sent in the subscribe request.
+
+## [0.7.10] - 2026-06-22
+
+### Changed
+
+- **Login/register captcha is now invisible.** The altcha widget no longer shows an “I’m not a robot” checkbox. It stays hidden and solves its proof-of-work in the background as soon as the sign-in form gains focus (`auto="onfocus"`), then submits the token with the form — no click required. The browser e2e was updated to drive this invisible flow (and still fails if the CSP blocks the worker).
+
+## [0.7.9] - 2026-06-21
+
+### Fixed
+
+- **Sign-in no longer hangs on “Verifying…”.** The login/register captcha widget runs its proof-of-work in a `blob:` web worker. The app CSP tightened in 0.7.8 declared no `worker-src`, so the worker fell back to `default-src 'self'` and was blocked — the captcha never completed and nobody could sign in. Added `worker-src 'self' blob:`. A test now asserts the served `/login` page is delivered under a CSP the captcha widget can actually run in, so this can't silently regress again.
+
+## [0.7.8] - 2026-06-21
+
+### Changed
+
+- **Scope the relaxed CSP to the marketing landing only.** The analytics/telemetry/webfont allowances added in 0.7.6–0.7.7 were applied app-wide; they now apply only to the landing's HTML documents (`/`, `/privacy`). The dashboard, API and static assets keep a tight policy (`connect-src 'self'`, `font-src 'self'`, no third-party analytics hosts).
+
+## [0.7.7] - 2026-06-21
+
+### Fixed
+
+- **Landing: webfonts no longer blocked by CSP.** The landing inlines its fonts as base64 `data:` URIs, which `font-src 'self'` blocked (the page silently fell back to system fonts). `font-src` now allows `data:`.
+
+## [0.7.6] - 2026-06-21
+
+### Fixed
+
+- **Landing: Content-Security-Policy now allows everything the landing loads.** Building on 0.7.5 (which only unblocked the telemetry fetch), the CSP now also allows the analytics the landing actually loads at runtime — Umami (`stats.techskills.academy`, script + beacon) and Google Tag Manager (gtm.js + GA/server-side collection) — but only the hosts that are configured (`LANDING_UMAMI_WEBSITE_ID` / `LANDING_GTM_ID`), so self-hosters without analytics keep a tight policy. The “Live fleet” stats and analytics were previously blocked by CSP and silently failed.
+
+## [0.7.5] - 2026-06-21
+
+### Fixed
+
+- **Landing: the “Live fleet” stats now actually appear.** The section fetches the public telemetry endpoint client-side, but the app’s Content-Security-Policy (`connect-src 'self'`) silently blocked the cross-origin request, so the section stayed hidden. `connect-src` now allows `https://telemetry.techskills.academy`. (Completed in 0.7.6, which also unblocks analytics.)
+
+## [0.7.4] - 2026-06-21
+
+### Fixed
+
+- **Landing: point app links at the real domain.** The marketing site referenced a separate `app.poststack.techskills.academy` host that does not exist (its “Open the app” links were dead). The app and its marketing page are a single deployment on one domain, so those links now point at `https://poststack.techskills.academy/login` and the FAQ wording was corrected.
+
+## [0.7.3] - 2026-06-21
+
+### Added
+
+- **Landing: per-platform fleet breakdown.** The “Live fleet” section now shows a per-platform breakdown of connected channels (animated bars with platform glyphs) alongside the headline counters, drawn from the public telemetry endpoint’s aggregate data. Reveals only when there are reporting instances.
+
+### Changed
+
+- **Landing: privacy page now discloses telemetry.** Added an “Anonymous usage telemetry” section to the privacy page (what an aggregate snapshot contains, what it never contains, the opt-out env var, and a link to `docs/PRIVACY.md`); the fleet section deep-links to it. Mobile fleet cards render 2-up.
+
+## [0.7.2] - 2026-06-20
+
+### Added
+
+- **Dashboard stats caching.** The webhook and engagement stats tiles now reuse their last computed aggregate for a short window instead of re-scanning the underlying tables on every dashboard load. Configurable via `STATS_CACHE_TTL_MS` (default 30000 ms; set `0` to always compute live). No schema change.
+
+### Changed
+
+- **Self-hosting docs.** Sharpened the README + deploy guide for self-hosters (prebuilt images, HTTPS-in-front guidance, Meta OAuth redirect URIs).
+
+## [0.7.1] - 2026-06-19
+
+### Added
+
+- **Telemetry: per-platform breakdown.** The anonymous daily usage snapshot now includes a per-platform breakdown of messages sent and webhooks processed (and comment replies) — counts only, grouped by platform (e.g. Facebook, Instagram). Still no message content, contact data, tokens, or secrets.
+
+## [0.7.0] - 2026-06-19
+
+### Added
+
+- **Landing: TechSkills Academy ecosystem footer.** The marketing footer links back to the hub ("Part of the TechSkills Academy ecosystem · All tools · Open source"), per the ecosystem-footer standard.
+- **Landing: cookie consent + privacy.** A consent manager (vanilla-cookieconsent) with "Cookies" and "Privacy" footer links and a `/privacy` page (now served by the app).
+- **Landing: runtime-configured, privacy-first analytics.** Cookieless Umami + optional server-side GTM (GA4 + Meta CAPI). The app injects the config (`window.__POSTSTACK_ANALYTICS__`) into the served HTML from its environment — nothing is baked into the image. Set `LANDING_UMAMI_WEBSITE_ID` / `LANDING_GTM_ID` (+ optional `LANDING_UMAMI_SRC`) to enable; unset (e.g. on staging) ⇒ zero trackers, no banner. Self-hosters point it at their own analytics. Umami is cookieless; GTM loads only after consent.
+- **Response-time metrics.** PostStack now records how quickly each inbound comment/DM is handled: webhook processing time and time-to-first-reply (intentional sequence delays excluded — only immediate replies are timed). View per-platform answer rate and average first-reply time on the overview, or via `GET /api/v1/stats/response-times` (scope `stats:read`). Metrics roll up daily and survive history compaction.
+- **Anonymous usage telemetry (opt-out).** Self-hosted instances send the maintainer an anonymous daily snapshot — a random instance id, a salted hash of the domain (never the domain itself), deployment shape (versions, platform/integration on-off flags), and aggregate counts — to inform the roadmap. **No message content, contact data, tokens, or secrets are ever sent.** Enabled by default; disable with `POSTSTACK_TELEMETRY_DISABLED=true`, or repoint with `TELEMETRY_URL`. See [`docs/PRIVACY.md`](docs/PRIVACY.md).
+
+## [0.6.1] - 2026-06-18
+
+### Changed
+
+- **Dependency bumps.** graphile-worker 0.17, zod 4.4, pg 8.21, @hono/node-server 2.0.5, @playwright/test 1.61, and the Docker build GitHub Actions (build-push v7, setup-buildx v4, login v4). No functional changes.
+
+## [0.6.0] - 2026-06-18
+
+### Added
+
+- **Auto-Story templates.** Auto-published Story cards now use a selectable template — `framed`, `phone`, `fullbleed` or `classic` — chosen per brand, styled with the brand's accent + name, with a live preview on the Brands page. (Custom/imported templates are a planned PRO extension.)
+- **AI rephrasing for any OpenAI-compatible provider.** Provider-neutral settings (`AI_API_KEY` / `AI_BASE_URL` / `AI_MODEL`; legacy `OPENAI_*` still honored) so you can point rephrasing at OpenAI, OpenRouter, Groq, a local Ollama, etc. A "rephrase with AI" toggle is now available directly in the rule editor.
+- **Approvals: public comment + DM together.** A comment-triggered rule (`reply_mode` comment/both) held for approval now parks BOTH the public comment reply and the DM, and approving sends both. Approvals also gained a "Recently resolved" history (sent/rejected) and an "open in inbox" deep-link.
+- **Inbox search & date filters.** Filter conversations by contact name, a rolling date window, or a custom from–to range.
+
+### Changed
+
+- **Approvals redesigned** into scannable cards showing who the reply goes to, the triggering message, and the exact comment/DM that will be sent.
+- **Settings reorganized into tabs** (Account · API keys · License · Integrations · Sources · Automation · Data); Sources and API keys now live under Settings. The Webhooks page is reorganized into tabs. Credential rows redesigned for readability.
+- **`.env.example`** rewritten to document every supported variable.
+
+## [0.5.0] - 2026-06-17
+
+### Added
+
+- **Marketing homepage.** `poststack.techskills.academy` now serves the PostStack landing page at `/` (anonymous visitors see the marketing site; logged-in users go straight to the panel). The app, its login, and all OAuth/webhook endpoints keep their existing URLs — no domain change.
+- **PostStack PRO licenses on sale.** Two purchasable licenses wired into the landing: PRO annual and a one-time Lifetime, with introductory launch pricing through 31 Jul 2026. A self-hosted install validates a license from the whole PostStack product family out of the box.
+
+### Added
+
+- **Automatic history compaction.** Webhook events and post reactions older than HISTORY_RETENTION_DAYS (default 60) are rolled into compact aggregates and deleted, keeping the database small on shared/limited Postgres — all-time counts and the Engagement view stay correct (only raw payloads and reactor identity are dropped). Set HISTORY_RETENTION_DAYS=0 to keep everything.
+
+## [0.4.32] - 2026-06-17
+
+### Changed
+
+- **Brand limit is now enforced at runtime, not just when creating a brand.** On the free plan an instance that already had several brands (from a seed, migration, or a downgrade from Pro) kept publishing through all of them. Now brands beyond the plan's limit are shown as **🔒 PRO** on the Brands page (still visible, with an upgrade link) and are excluded from composing and publishing — the oldest brand stays active. Licensed plans are unaffected (unlimited brands).
+
+### Fixed
+
+- A stored license token that can no longer be decrypted (e.g. after rotating `ENCRYPTION_KEY`) no longer breaks the license check — it now falls back to the free plan instead of erroring, so publishing keeps working.
+
+## [0.4.31] - 2026-06-17
+
+### Added
+
+- **More credentials configurable in Settings** (extends the Meta-only support): Google/YouTube OAuth (client id + secret), AI rephrase (OpenAI-compatible API key, base URL, model), the channel-alert and ReelStack webhook secrets, and the ALTCHA CAPTCHA key. Each is stored encrypted, overrides its env var, and is grouped by integration in Settings — set them from the dashboard instead of editing `.env`.
+
+### Changed
+
+- **Smoother UI motion.** Page navigations and htmx swaps now use the View Transitions API where supported (disabled under reduced-motion), and the binary on/off toggles render as switches.
+
+### Internal
+
+- Deploy housekeeping prunes unused images aggressively (the test host had been filling up with old tagged images); added publishing-layer Graph-API-version contract tests; squashed the migrations into a single baseline (pre-release).
+
+## [0.4.30] - 2026-06-17
+
+### Added
+
+- **Set your Meta app credentials in the dashboard (no more editing `.env`).** Settings → *Meta App configuration → Your credentials* lets you paste your **App ID**, **App Secret**, and **Webhook Verify Token** straight into the app. Values are stored **encrypted** (AES-256-GCM) and a value set here **overrides** the matching environment variable, taking effect without a redeploy. Secrets are never shown back — only a masked "set" indicator — and a *Clear* button reverts a field to its env var. Existing env-based deploys keep working unchanged (a key with no dashboard value falls back to its env var). Foundation is generic — more credential groups (Google/YouTube, AI, webhooks) will follow on the same mechanism.
+
+## [0.4.28] - 2026-06-17
+
+### Changed
+
+- **Relicensed from AGPL-3.0 to the Elastic License 2.0 (source-available).** You can still self-host, use, modify, and redistribute PostStack freely; the new limits are that you may not offer it to third parties as a hosted/managed service and may not circumvent the license-key functionality. Added a Contributor License Agreement (`CLA.md`) that lets the project relicense in the future (e.g. to a more permissive license).
+- **Repositioned the project as "PostStack"** — a self-hosted social media *management* platform (publishing & scheduling + inbox auto-replies + drip sequences + CRM), not just an inbox-automation / ManyChat alternative. Updated README, CONTRIBUTING, API docs, and the package description accordingly.
+
+## [0.4.27] - 2026-06-17
+
+### Changed
+
+- **Filters apply instantly — no "Apply" click.** The filter bars on Content, Channels and Queue now apply on interaction (selects on change, the search box debounced as you type), like the inbox. The redundant "Apply" button is hidden (kept as a no-JS fallback).
+- **Content status filter is now a dropdown built from your actual statuses** instead of a free-text box you had to type into. Statuses are open-set (NocoDB import), so the options are derived from the statuses present in your workspace (plus a deep-linked value is always included).
+
+## [0.4.26] - 2026-06-17
+
+### Changed
+
+- **Auto-Story and the automatic First comment are now PRO features** (publishing area). On a free instance the channel panels show a "🔒 (PRO)" upgrade prompt instead of the controls, the compose per-post overrides are hidden, and — the authoritative gate — the publish worker never enqueues a Story or first-comment for an unlicensed instance even if a toggle was left on from a lapsed license.
+
+### Fixed
+
+- **"Published posts" (and "Queue →") in the channel view now filter to that channel.** They linked to the unfiltered `/queue`; they now carry `?channel=<id>` so you see only that channel's posts (the queue already supported the filter).
+
+## [0.4.25] - 2026-06-17
+
+### Fixed
+
+- **Channel Auto-Story (and First comment) toggles now update in place — no page reload.** Their forms targeted `#ch-detail-head`, but the panels (button + "Currently on/off" status) live in separate sections, so toggling left them stale until a manual refresh. The actions now return the affected panel as an htmx out-of-band swap, so the label/status flip immediately alongside the toast.
+
+### Added
+
+- **In-flight feedback on every action.** Any control issuing an htmx request now shows a spinner, dims, and blocks re-clicks until the request completes — no more "dead" clicks where nothing visibly happens. Applies app-wide via a single `.htmx-request` style.
+
+## [0.4.24] - 2026-06-17
+
+### Fixed
+
+- **Publishing now uses the same Graph API version as messaging.** The publishing layer (`providers/meta.ts` — post/reel/photo/video/story publish, media containers, token introspection) had a **hardcoded `v21.0`** while the inbound/messaging layer was on `v25.0`, so bumping `META_API_VERSION` silently left publishing two years behind. The publishing layer now derives its version from the single source of truth (`GRAPH_API_BASE`), and a guard test fails the build if any Meta module reintroduces a hardcoded version literal.
+
+### Added
+
+- **Meta Graph API version-bump verification.** `META_API_VERSION` lives in one place (`src/lib/platforms/constants.ts`). Two new tools de-risk bumping it:
+  - A **single-source-of-truth guard test** — fails if any platform/provider module hardcodes a `graph.facebook.com/vNN.N` literal instead of `GRAPH_API_BASE`.
+  - A **live version-probe** (`scripts/meta-version-probe.ts`, `npm run probe:meta`) — hits the real Graph API on a target version with real tokens and reports a deterministic PASS/FAIL per endpoint/field our parsers depend on (debug_token, `/me`, page node, `subscribed_apps`, feed, IG identity + follow check, and an opt-in publish→first-comment→DM→delete write cycle). Env-gated (skips cleanly without creds), exit code reflects failures — run it before bumping to see exactly what changed.
+
+## [0.4.23] - 2026-06-17
+
+### Added
+
+- **Rules can enroll a contact into a drip sequence.** A rule's response type can now be **"Enroll in a drip sequence"** (`response_type: "sequence"` + `response_config.sequence_id`): when the trigger (DM/comment keyword, postback, welcome, reaction, …) fires, the matched contact is enrolled into the chosen sequence and its first step is scheduled. Enrollment is once-per-contact (idempotent), respects the rule's cooldown/cap, and is gated to the `sequences` PRO feature. Previously a `sequence` rule was a no-op placeholder the API rejected.
+  - **Rules UI**: the response picker offers the sequence option (with a sequence selector) on create *and* edit; the rule list shows `🧵 enroll → <sequence>`.
+  - **Compose**: a comment auto-reply can choose **"Enroll in a drip sequence"** instead of sending a DM — the publish loop-back provisions a `sequence` rule scoped to the published media.
+  - **API**: `POST`/`PATCH /api/v1/rules` accept `sequence` and validate that `sequence_id` points at an *active* sequence in the workspace (422 otherwise). The enroll endpoint and the rule engine now share one transactional-outbox enrollment helper.
+
+## [0.4.22] - 2026-06-17
+
+### Fixed
+
+- **Comment → DM auto-reply no longer leaves a duplicate row in the thread.** The private-reply send returned no message id, so the inbound echo of our own DM was logged as a second outbound message (cosmetic — the recipient still got a single DM). `sendPrivateReply` now returns the Graph `message_id` and the worker stores it, so the echo dedups correctly.
+
+## [0.4.21] - 2026-06-16
+
+### Added
+
+- **Unified Compose.** The composer is now a single screen to author *and* publish a post with every content automation wired in:
+  - Per-platform **Automation** section — **first comment** (auto-posted under the post), **Auto-Story** (share to Story on publish, Meta), and **comment-keyword → DM auto-reply** — each capability-gated to the platforms that support it and stored on the post (`first_comment`, `auto_story`, `auto_reply`).
+  - **Publish section** — Save as draft, Publish now, or Schedule, straight from the composer (each post goes to its brand-resolved channel; the automations fire on publish).
+- Per-post overrides flow through the publish request, so a post can override the channel-level first-comment / Auto-Story defaults.
+
+## [0.4.20] - 2026-06-16
+
+### Added
+
+- **Contact names in the inbox.** Meta DM webhooks deliver only the sender's PSID/IGSID, so a new contact showed as a raw numeric id. The inbox now resolves the sender's public profile (name + avatar; username on Instagram) via the Meta User Profile API when a contact is first created, and displays the name. Best-effort — a failed lookup never blocks message processing, and an existing name/avatar is never overwritten.
+
+## [0.4.19] - 2026-06-16
+
+### Added
+
+- **Meta 24h messaging-window handling.** A manual human reply sent after Meta's 24-hour standard messaging window now goes out with the `HUMAN_AGENT` message tag (allowed up to 7 days) instead of being rejected (`#10` / subcode `2018278`). Automated rule replies stay on `RESPONSE` (bots may not use `HUMAN_AGENT`, and they fire inside the window anyway).
+- **Inbox window indicator.** The reply composer shows a heads-up when the window is closing or closed: "24h reply window closes in Xh", "24h window closed — sending as a human-agent message (allowed up to 7 days)", or "outside the 7-day messaging window — Meta will likely reject this reply". Informational only — it never blocks sending.
+
+## [0.4.18] - 2026-06-16
+
+### Fixed
+
+- **License revocation now actually works.** The CRL consumer compared a token's raw `order` claim against an `orders` field the seller never publishes, so a revoked (e.g. refunded) license was never refused. It now hashes the `order` (SHA-256) and matches against the published `order_hashes`.
+
+### Changed
+
+- Consume the revocation list as a **k-anonymity prefix range query**: the gate sends only a short hex prefix of `SHA-256(order)` and checks full-hash membership locally, so the server never sees the full hash or the total revocation count. Cache is keyed per prefix bucket; fail-open semantics on a CRL outage are unchanged (never lock out a paying customer).
+
+## [0.1.0] - 2026-06-06
+
+First public release.
+
+### Added
+
+- Facebook Pages and Instagram Business OAuth channel connection, plus a manual System-User token mode for non-expiring connections
+- Meta webhook receiver with HMAC-SHA256 signature verification and per-channel secrets
+- Auto-reply rule engine with triggers for keyword, comment keyword, postback, welcome, story reply, story mention, emoji reaction, and fallback/default -- with per-contact cooldown
+- Comment automation: reply publicly under the comment, send a private DM (Meta `private_replies`) on first touch, or both -- scoped to a specific post or all posts, on Facebook and Instagram
+- Optional AI rephrasing of any reply (including a random pool) via an OpenAI-compatible endpoint
+- Live inbox: conversation list, message thread, manual reply, mark read / close / pause automation
+- Drip sequences with configurable per-step delays and API-driven enrollment
+- Contacts CRM with full-text search, color-coded tags, and subscription state
+- API key management and automatic OAuth token refresh
+- API-first REST surface at `/api/v1/*` with Bearer auth and interactive Scalar docs at `/api/docs`
+- Channel health detection (auth failures flag `needs_reauth`) with optional outbound alert webhook, plus a circuit breaker that parks and drains outbound traffic during an outage
+- Message retention pruning and an append-only audit log
+- Docker Compose one-command startup; production compose with nginx + pre-built GHCR images
+- Optional NocoDB integration (spreadsheet view of all data)
+
+### Architecture
+
+- Web and worker run on **Hono** + **Bun**; UI is server-rendered `hono/html` with htmx + Alpine (no client framework)
+- **PostgreSQL** + **Drizzle ORM**; **graphile-worker** for the job queue -- no Redis (rate limiting, JWT denylist, and outgoing-message idempotency are all Postgres-backed)
+- OAuth tokens encrypted at rest with AES-256-GCM

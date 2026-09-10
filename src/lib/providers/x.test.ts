@@ -1,0 +1,99 @@
+import { describe, it, expect, afterEach, vi } from "vitest";
+import { xProvider } from "./x";
+import { isProvider } from "./index";
+import { TokenInvalidError } from "./errors";
+
+afterEach(() => vi.unstubAllGlobals());
+const tokens = { accessToken: "AT", refreshToken: "RT" };
+
+describe("x provider", () => {
+  it("is registered + refreshable + text capability", () => {
+    expect(isProvider("x")).toBe(true);
+    expect(xProvider.requiresTokenRefresh()).toBe(true);
+    expect(xProvider.capabilities().map((c) => c.format)).toContain("text");
+  });
+
+  it("refreshToken rotates the refresh token", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ access_token: "n", refresh_token: "rot", expires_in: 7200 }), { status: 200 })));
+    const t = await xProvider.refreshToken(tokens);
+    expect(t.refreshToken).toBe("rot");
+  });
+
+  it("healthCheck returns the user id", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: { id: "u1", username: "me" } }), { status: 200 })));
+    const info = await xProvider.healthCheck(tokens);
+    expect(info.accountId).toBe("u1");
+    expect(info.displayName).toBe("me");
+  });
+
+  it("healthCheck 401 -> TokenInvalidError", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ detail: "x" }), { status: 401 })));
+    await expect(xProvider.healthCheck(tokens)).rejects.toBeInstanceOf(TokenInvalidError);
+  });
+
+  it("healthCheck rejects a non-string account id [PSA55]", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: { id: { nested: true } } }), { status: 200 })));
+    await expect(xProvider.healthCheck(tokens)).rejects.toThrow(); // not coerced into accountId
+  });
+
+  it("publish a text post returns the tweet id", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: { id: "tw_1" } }), { status: 200 })));
+    const h = await xProvider.publish({ tokens, accountId: "u1", request: { format: "text", media: [], caption: "hi" }, mediaUrls: [] });
+    expect(h.providerHandle).toBe("tw_1");
+  });
+
+  it("rejects a non-string id instead of coercing it into the handle [PSA51]", async () => {
+    // A hostile/malformed response with id as an OBJECT used to pass the `!id` guard.
+    vi.stubGlobal("fetch", vi.fn(async () => new Response(JSON.stringify({ data: { id: { nested: true } } }), { status: 200 })));
+    await expect(
+      xProvider.publish({ tokens, accountId: "u1", request: { format: "text", media: [], caption: "hi" }, mediaUrls: [] }),
+    ).rejects.toThrow(); // classified error, not "[object Object]" stored as the handle
+  });
+
+  it("publish text post includes made_with_ai when options.aiDisclosed is a boolean [AIDISC1]", async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(JSON.stringify({ data: { id: "tw_ai" } }), { status: 200 });
+      }),
+    );
+    await xProvider.publish({
+      tokens,
+      accountId: "u1",
+      request: { format: "text", media: [], caption: "hi", options: { aiDisclosed: true } },
+      mediaUrls: [],
+    });
+    expect(body.made_with_ai).toBe(true);
+  });
+
+  it("publish text post omits made_with_ai when options.aiDisclosed is not a boolean", async () => {
+    let body: Record<string, unknown> = {};
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) => {
+        body = JSON.parse(String(init?.body ?? "{}"));
+        return new Response(JSON.stringify({ data: { id: "tw_noai" } }), { status: 200 });
+      }),
+    );
+    await xProvider.publish({
+      tokens,
+      accountId: "u1",
+      request: { format: "text", media: [], caption: "hi" },
+      mediaUrls: [],
+    });
+    expect("made_with_ai" in body).toBe(false);
+  });
+
+  // LIPUB1: chunked media upload isn't implemented — a media post must FAIL LOUDLY, never silently drop
+  // the image/video and post text only (which is what the old code path did once a media format reached it).
+  it.each(["image", "video"])("a %s post fails loudly (media upload not implemented) — never a silent text-only tweet", async (format) => {
+    const fetchSpy = vi.fn(async () => new Response(JSON.stringify({ data: { id: "tw_x" } }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchSpy);
+    await expect(
+      xProvider.publish({ tokens, accountId: "u1", request: { format, media: [{ mediaId: "m" }], caption: "c" }, mediaUrls: ["https://cdn/x"] }),
+    ).rejects.toThrow(/not implemented/);
+    expect(fetchSpy).not.toHaveBeenCalled(); // never hit the tweets endpoint
+  });
+});

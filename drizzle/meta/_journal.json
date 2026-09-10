@@ -1,0 +1,55 @@
+{
+  "version": "7",
+  "dialect": "postgresql",
+  "entries": [
+    {
+      "idx": 0,
+      "version": "7",
+      "when": 1781380397832,
+      "tag": "0000_init",
+      "breakpoints": true
+    },
+    {
+      "idx": 1,
+      "version": "7",
+      "when": 1782313138351,
+      "tag": "0001_gmail_channel",
+      "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "7",
+      "when": 1782410212687,
+      "tag": "0002_outbound_webhooks",
+      "breakpoints": true
+    },
+    {
+      "idx": 3,
+      "version": "7",
+      "when": 1782653112705,
+      "tag": "0003_telemetry_and_lead_capture",
+      "breakpoints": true
+    },
+    {
+      "idx": 4,
+      "version": "7",
+      "when": 1782725231796,
+      "tag": "0004_webhook_observability_statuses",
+      "breakpoints": true
+    },
+    {
+      "idx": 5,
+      "version": "7",
+      "when": 1782980939784,
+      "tag": "0005_post_title",
+      "breakpoints": true
+    },
+    {
+      "idx": 6,
+      "version": "7",
+      "when": 1785512942587,
+      "tag": "0006_youtube_options_and_ai_disclosure",
+      "breakpoints": true
+    }
+  ]
+}

@@ -1,0 +1,32 @@
+# Node base for reproducible `npm ci`; Bun binary for the runtime.
+FROM node:22.23.2-alpine@sha256:c610fcdfb1d5b4740dd70c284ed3cb16bb857e0f7166196e36a5501df7a3aa32 AS base
+RUN apk add --no-cache libc6-compat
+COPY --from=oven/bun:1.3.14-alpine@sha256:5acc90a93e91ff07bf72aa90a7c9f0fa189765aec90b47bdbf2152d2196383c0 /usr/local/bin/bun /usr/local/bin/bun
+WORKDIR /app
+
+FROM base AS deps
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev
+
+FROM base AS runner
+ENV NODE_ENV=production
+# Pin the process clock to UTC so app-clock writes/reads share the DB session's UTC domain — a
+# non-UTC host skews the retention cutoff and silently over-deletes in-window messages.
+ENV TZ=UTC
+
+RUN addgroup --system --gid 1001 nodejs
+RUN adduser --system --uid 1001 --ingroup nodejs worker
+
+COPY --from=deps --chown=worker:nodejs /app/node_modules ./node_modules
+COPY --chown=worker:nodejs tsconfig.json package.json ./
+COPY --chown=worker:nodejs src ./src
+COPY --chown=worker:nodejs worker ./worker
+# Liveness probe read by the container healthcheck.
+COPY --chown=worker:nodejs docker/worker-healthcheck.sh ./docker/worker-healthcheck.sh
+
+USER worker
+
+HEALTHCHECK --interval=15s --timeout=5s --start-period=40s --retries=3 \
+  CMD sh /app/docker/worker-healthcheck.sh
+
+CMD ["bun", "worker/inbox-worker.ts"]
