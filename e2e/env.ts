@@ -25,7 +25,7 @@ export function serverEnv(): Record<string, string> {
     APP_URL: E2E_BASE_URL,
     DATABASE_URL: E2E_DATABASE_URL,
     REGISTRATION_ENABLED: "true",
-    BRAND_NAME: "PostStack",
+    BRAND_NAME: "Faina",
     // 32+ char secrets (validated at boot).
     ENCRYPTION_KEY: "e2e-encryption-key-0123456789abcdef0123456789",
     JWT_SECRET: "e2e-jwt-secret-0123456789abcdef0123456789abcdef",
@@ -33,7 +33,7 @@ export function serverEnv(): Record<string, string> {
     // Force the offline JWKS fallback path: an unreachable live endpoint → the server uses
     // SELLF_JWKS_FALLBACK to verify our minted PRO token.
     LICENSE_JWKS_URL: "http://127.0.0.1:9/jwks",
-    LICENSE_PRODUCT_SLUG: "poststack",
+    LICENSE_PRODUCT_SLUG: "faina",
     SELLF_JWKS_FALLBACK: jwksFallbackJson(),
     // No revocation in e2e (empty disables it).
     LICENSE_REVOCATION_URL: "",
