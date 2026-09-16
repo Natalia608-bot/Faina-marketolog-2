@@ -1,18 +1,4 @@
-// WEBHOOKSUB1: single source of truth for which Page webhook fields each platform needs subscribed.
-// Both the connect-time subscriber (`subscribePageWebhooks`) and the reconcile/status check read from
-// here, so a self-hosted PRO instance always auto-configures the COMPLETE set — never the partial set
-// that left message_echoes / reactions / receipts undelivered and required a manual re-subscribe.
-//
-// IMPORTANT: these are `page`-object subscribed_apps fields. `comments` is NOT a valid page field
-// (Graph #100 — it belongs to the `instagram` object app-level subscription); including it makes the
-// whole subscribed_apps POST fail atomically. IG media-comment webhooks arrive via the app-level
-// `instagram` object subscription, not a page field — so it is intentionally absent here.
-//
-// WHSUBOPTIN1: only subscribe to fields PostStack actually consumes. `messaging_optins` is omitted —
-// no handler consumes optin events and Meta won't durably hold that subscription for this app, so
-// requiring it produced a permanent false "missing" that re-subscribing could never clear.
-
-/** Page webhook fields PostStack relies on. Ordered for stable display. */
+/** Page webhook fields Faina relies on. Ordered for stable display. */
 export const FACEBOOK_PAGE_FIELDS = [
   "messages",
   "messaging_postbacks",
@@ -39,7 +25,7 @@ export const INSTAGRAM_PAGE_FIELDS = [
  *  names are the EXACT instagram-object webhook field names from the Meta dashboard (v25.0): `messages`,
  *  `messaging_postbacks`, `message_reactions` (NOT `messaging_reactions` — that name is invalid and would
  *  make the subscribed_apps POST fail atomically, killing all IG-Login inbound), `messaging_seen`,
- *  `comments`, and `live_comments`. Only fields PostStack consumes (WHSUBOPTIN1 principle: omit
+ *  `comments`, and `live_comments`. Only fields Faina consumes (WHSUBOPTIN1 principle: omit
  *  messaging_optins/_referrals — no handler). `comments` + `live_comments` are REQUIRED so an
  *  IG-Login-only channel receives comment webhooks (incl. comments left during an IG Live) for
  *  comment→DM automation; both route into the same comment pipeline. (Verified against the live app's
