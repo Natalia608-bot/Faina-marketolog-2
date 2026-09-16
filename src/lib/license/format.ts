@@ -1,18 +1,3 @@
-// Offline verification of Sellf-issued license tokens. Ported from the captions
-// web verifier (apps/web/functions/_lib/sellf-license.ts) — same wire format and
-// crypto, runtime-agnostic WebCrypto so it runs under both Bun and Node (Vitest).
-//
-// Token: `payloadB64url.sigB64url`. payload = base64url(JSON(claims)). The
-// signature is ECDSA P-256 / SHA-256 over the ASCII bytes of the payload segment.
-//
-// Interop note: Sellf signs with node `createSign("SHA256").sign()`, emitting an
-// ASN.1 DER signature; WebCrypto's `verify` wants raw IEEE-P1363 r||s, so we
-// convert DER -> raw before verifying. The public key arrives as SPKI PEM and is
-// converted PEM -> DER for importKey("spki", …).
-//
-// Seller binding is enforced upstream by using a seller-scoped JWKS URL (only the
-// TSA seller's keys are fetched); product binding is enforced here via claims.product.
-
 export interface Claims {
   v: number;
   kid: string;
@@ -50,13 +35,7 @@ function normHost(h: string): string {
   return (h ?? "").trim().toLowerCase().replace(/:\d+$/, "").replace(/^www\./, "");
 }
 
-/**
- * Whether `host` falls under the license's `domain`. Policy A: the licensed domain covers itself
- * AND every subdomain (one purchase = one customer's whole domain). Both sides are normalized
- * (lowercased, port stripped, leading `www.` stripped). An explicit `*.` prefix on the licensed
- * domain is accepted and treated the same as the bare domain. The match respects the dot boundary
- * so `example.com` never matches `badexample.com` or `example.com.evil.com`.
- */
+
 export function domainMatches(licenseDomain: string, host: string): boolean {
   const dom = normHost((licenseDomain ?? "").replace(/^\*\./, ""));
   const h = normHost(host);
@@ -64,10 +43,7 @@ export function domainMatches(licenseDomain: string, host: string): boolean {
   return h === dom || h.endsWith("." + dom);
 }
 
-/**
- * The lowercased hostname of a URL (the instance's own public host, used as the match target).
- * Falls back to a bare domain string, and returns null for anything that's neither.
- */
+
 export function hostFromUrl(url: string): string | null {
   const s = (url ?? "").trim();
   if (!s) return null;
