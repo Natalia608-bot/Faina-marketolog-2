@@ -1,7 +1,3 @@
-// The license brain: resolves the instance token, verifies it against the seller
-// JWKS, derives the tier/feature state, persists it, and answers feature checks.
-// This is the single entry point the rest of the app uses (hasFeature / requireFeature).
-
 import { env } from "@/lib/env";
 import { verifyLicense, hostFromUrl, type JwksKey, type Claims } from "@/lib/license/format";
 import { getJwks, parseJwksJson } from "@/lib/license/jwks";
