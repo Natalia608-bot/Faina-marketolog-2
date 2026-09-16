@@ -22,17 +22,17 @@ export interface FeatureDef {
 
 export const FEATURES = [
   // ── replies wing (the reply/inbox feature set) ──────────────────────────────────────────────
-  { key: "personalization", area: "replies", minTier: status: "live", label: "Personalization placeholders ({imie}/{name})", description: "Insert the contact's name into auto-replies." },
-  { key: "ai_rephrase", area: "replies", minTier: status: "live", label: "AI rephrasing", description: "Rephrase replies with an LLM for variety." },
-  { key: "ai_draft", area: "replies", minTier: status: "live", label: "AI-drafted replies", description: "Generate an AI draft reply for a conversation (auto, or on demand from the inbox), parked for your approval." },
-  { key: "sequences", area: "replies", minTier: status: "live", label: "Drip sequences", description: "Automated multi-step message sequences." },
-  { key: "interactive_messages", area: "replies", minTier: status: "live", label: "Buttons and quick replies", description: "Send interactive buttons and quick replies." },
-  { key: "follow_gate", area: "replies", minTier: status: "live", label: "Follow-gate", description: "Require a follow before delivering a reply." },
-  { key: "multi_channel", area: "replies", minTier: status: "live", label: "More than one channel per platform", description: "Connect a 2nd+ channel of the same platform (e.g. another FB page / IG account)." },
-  { key: "non_meta_channels", area: "replies", minTier: status: "live", label: "Channels other than Facebook/Instagram", description: "Any channel that isn't Facebook/Instagram (Telegram, future Gmail, …)." },
-  { key: "contacts_crm", area: "replies", minTier: status: "live", label: "The contacts CRM (managing individual people)", description: "The contacts CRM: contacts list, tags, assignment. Reading the inbox is free." },
-  { key: "manual_reply", area: "replies", minTier: status: "live", label: "Replying to conversations by hand (rules still auto-reply for free)", description: "A human typing a reply in the inbox / via the API. Free = rules auto-reply only." },
-  { key: "reaction_trigger", area: "replies", minTier: status: "live", label: "Auto-replies triggered by a message reaction", description: "Rules that fire on a message reaction (free triggers are keyword/comment only)." },
+  { key: "personalization", area: "replies", minTier: "free", status: "live", label: "Personalization placeholders ({imie}/{name})", description: "Insert the contact's name into auto-replies." },
+  { key: "ai_rephrase", area: "replies", minTier: "free", status: "live", label: "AI rephrasing", description: "Rephrase replies with an LLM for variety." },
+  { key: "ai_draft", area: "replies", minTier: "free", status: "live", label: "AI-drafted replies", description: "Generate an AI draft reply for a conversation (auto, or on demand from the inbox), parked for your approval." },
+  { key: "sequences", area: "replies", minTier: "free", status: "live", label: "Drip sequences", description: "Automated multi-step message sequences." },
+  { key: "interactive_messages", area: "replies", minTier: "free", status: "live", label: "Buttons and quick replies", description: "Send interactive buttons and quick replies." },
+  { key: "follow_gate", area: "replies", minTier: "free", status: "live", label: "Follow-gate", description: "Require a follow before delivering a reply." },
+  { key: "multi_channel", area: "replies", minTier: "free", status: "live", label: "More than one channel per platform", description: "Connect a 2nd+ channel of the same platform (e.g. another FB page / IG account)." },
+  { key: "non_meta_channels", area: "replies", minTier: "free", status: "live", label: "Channels other than Facebook/Instagram", description: "Any channel that isn't Facebook/Instagram (Telegram, future Gmail, …)." },
+  { key: "contacts_crm", area: "replies", minTier: "free", status: "live", label: "The contacts CRM (managing individual people)", description: "The contacts CRM: contacts list, tags, assignment. Reading the inbox is free." },
+  { key: "manual_reply", area: "replies", minTier: "free", status: "live", label: "Replying to conversations by hand (rules still auto-reply for free)", description: "A human typing a reply in the inbox / via the API. Free = rules auto-reply only." },
+  { key: "reaction_trigger", area: "replies", minTier: "free", status: "live", label: "Auto-replies triggered by a message reaction", description: "Rules that fire on a message reaction (free triggers are keyword/comment only)." },
 
   // ── core (connection / access infra shared by both wings) ───────────────────────────────────
   { key: "managed_connection", area: "core", minTier: "pro", status: "live", label: "Meta managed connection (one token connects all Pages + Instagram)", description: "Connect one master FB/IG token that auto-enumerates Pages and linked Instagram accounts, mints and refreshes their tokens automatically." },
