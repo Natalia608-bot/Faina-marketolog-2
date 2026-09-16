@@ -1,20 +1,3 @@
----
-/**
- * Analytics.astro — privacy-first analytics + consent for the PostStack landing.
- *
- * Runtime-configured, NOT build-time. The Hono app injects
- *   <script>window.__POSTSTACK_ANALYTICS__ = { gtmId?, umamiId?, umamiSrc? }</script>
- * into the served HTML from its environment (see src/server/ui/landing.ts). This component only
- * emits the client logic that reads that global. Consequences:
- *   - The public image ships with NO tracking IDs (self-hosters set their own via env).
- *   - test vs prod differ purely by their compose env — no IDs set on test ⇒ zero trackers, no banner.
- *   - Changing IDs needs no rebuild.
- *
- * GTM flows through server-side GTM (t.poststack.techskills.academy → shared TrackStack):
- * GA4 forward + Meta CAPI. Umami is cookieless. Consent (Consent Mode V2) gates GTM; Umami is exempt.
- */
----
-
 <script>
   interface AnalyticsCfg {
     gtmId?: string;
@@ -22,13 +5,13 @@
     umamiSrc?: string;
   }
   const w = window as Window & {
-    __POSTSTACK_ANALYTICS__?: AnalyticsCfg;
+    __FAINA_ANALYTICS__?: AnalyticsCfg;
     dataLayer?: unknown[];
     gtag?: (...args: unknown[]) => void;
-    __poststack_gtm_id?: string;
+    __faina_gtm_id?: string;
     requestIdleCallback?: (cb: () => void, opts?: { timeout: number }) => void;
   };
-  const cfg: AnalyticsCfg = w.__POSTSTACK_ANALYTICS__ || {};
+  const cfg: AnalyticsCfg = w.__FAINA_ANALYTICS__ || {};
 
   // GTM Consent Mode V2 defaults (everything denied until the visitor opts in). Set before GTM loads;
   // the consent manager calls gtm.js only after consent (see lib/cookieconsent-init.ts → loadGtm).
@@ -49,8 +32,8 @@
       security_storage: "granted",
       wait_for_update: 500,
     });
-    w.dataLayer.push({ source_brand: "poststack" });
-    w.__poststack_gtm_id = cfg.gtmId;
+    w.dataLayer.push({ source_brand: "faina" });
+    w.__faina_gtm_id = cfg.gtmId;
   }
 
   // Umami: cookieless, consent-exempt — load directly when configured.
@@ -77,9 +60,9 @@
       return loaded;
     };
     const hasConsent = () => {
-      if (document.cookie.includes("poststack_consent=")) return true;
+      if (document.cookie.includes("faina_consent=")) return true;
       try {
-        return !!localStorage.getItem("poststack_cc_v1");
+        return !!localStorage.getItem("faina_cc_v1");
       } catch {
         return false;
       }
