@@ -1,4 +1,4 @@
-# Deploying & Updating PostStack
+# Deploying & Updating Faina
 
 Canonical, step-by-step runbook for **standing up a new instance** and **updating an existing
 one**. Written to be followed equally well by a human operator or an AI agent: every step has an
@@ -7,7 +7,7 @@ exact command and an expected result. For local development see the [README Quic
 > **Self-host model.** A production instance is a single Docker Compose stack — `nginx` →
 > `web` (Hono) + `worker` (graphile-worker) + `postgres`. All state lives in Postgres
 > (the `postgres_data` volume); there is no other store. Images are pulled from GHCR
-> (`ghcr.io/jurczykpawel/poststack` and `ghcr.io/jurczykpawel/poststack-worker`), built and published
+> (`ghcr.io/jurczykpawel/Faina` and `ghcr.io/jurczykpawel/Faina-worker`), built and published
 > by the `release.yml` GitHub Actions workflow on every `v*` tag.
 
 ---
@@ -21,16 +21,16 @@ Meta requires.
 
 ```bash
 # Fully managed: installs the stack AND configures a Cloudflare/Caddy domain with TLS.
-./local/deploy.sh poststack --domain-type=cloudflare --domain=inbox.example.com
+./local/deploy.sh Faina --domain-type=cloudflare --domain=inbox.example.com
 
 # Or run on the target server (installs the stack with auto-generated secrets; you then
 # put your own reverse proxy / Cloudflare in front for HTTPS):
-curl -fsSL https://stackpilot.techskills.academy/poststack | bash
+curl -fsSL https://stackpilot.techskills.academy/Faina | bash
 ```
 
 What it does for you, with no questions asked:
 
-- Generates and stores all secrets in `/opt/stacks/poststack/.env` (`chmod 600`):
+- Generates and stores all secrets in `/opt/stacks/faina/.env` (`chmod 600`):
   `POSTGRES_PASSWORD`, `ENCRYPTION_KEY`, `JWT_SECRET`, `CRON_SECRET`, `ALTCHA_HMAC_KEY`.
 - Sets `APP_URL` from `--domain`, `NODE_ENV=production`, and `TRUSTED_PROXY`
   (`cloudflare` for `--domain-type=cloudflare`, otherwise `proxy`).
@@ -39,7 +39,7 @@ What it does for you, with no questions asked:
 
 After it finishes, open `APP_URL/register` to create the owner account (§1.5), then connect Meta
 (§1.6). Re-running the installer **preserves the existing `.env`** (so `ENCRYPTION_KEY` stays stable
-and stored tokens keep decrypting). Update later with `./local/deploy.sh poststack --update`. What
+and stored tokens keep decrypting). Update later with `./local/deploy.sh Faina --update`. What
 StackPilot does **not** decide for you — Meta/Google app credentials and a PRO license — are set in
 the dashboard afterward.
 
@@ -66,8 +66,8 @@ the proxy, the registry, or the host, or when you're not using StackPilot.
 ### 1.2 Get the code and configure
 
 ```bash
-git clone https://github.com/jurczykpawel/poststack.git
-cd poststack
+git clone https://github.com/jurczykpawel/faina.git
+cd faina
 cp .env.example .env
 ```
 
@@ -133,7 +133,7 @@ account on an empty instance can always register, to create the owner.
    # → must echo back: ping123
    ```
 2. In the dashboard go to **Channels** and connect your first Facebook Page / Instagram account.
-   PostStack auto-subscribes the page to the required webhook fields (see **Webhooks → Subscriptions**
+   Faina auto-subscribes the page to the required webhook fields (see **Webhooks → Subscriptions**
    in the dashboard for active-vs-expected status).
 3. **(Optional) Instagram Business Login.** To connect a single Instagram account directly — for
    DMs + comments + follow-gate + publishing, **without** a Facebook page — set `INSTAGRAM_APP_ID` /
@@ -250,13 +250,13 @@ you always know which version is live and which to fall back to.
 ```bash
 # Logical dump (portable; restore with psql / pg_restore)
 docker compose -f docker-compose.prod.yml exec postgres \
-  pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" | gzip > poststack-$(date +%F).sql.gz
+  pg_dump -U "$POSTGRES_USER" "$POSTGRES_DB" | gzip > faina-$(date +%F).sql.gz
 ```
 
 Restore into a fresh stack:
 
 ```bash
-gunzip -c poststack-2026-06-16.sql.gz | \
+gunzip -c faina-2026-06-16.sql.gz | \
   docker compose -f docker-compose.prod.yml exec -T postgres psql -U "$POSTGRES_USER" "$POSTGRES_DB"
 ```
 
