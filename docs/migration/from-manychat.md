@@ -1,13 +1,13 @@
 # Migrating from ManyChat (and Chatfuel)
 
-ManyChat charges a subscription that grows with your contact count. PostStack is self-hosted: your
+ManyChat charges a subscription that grows with your contact count. Faina is self-hosted: your
 subscribers, tags, and automations live on your own server with no per-contact fee. This guide covers what
 to bring over and how.
 
 Migration from ManyChat has three parts:
 
 1. **Subscribers & tags** — exportable as CSV, brought into your CRM.
-2. **Automations / flows** — *not* exportable; rebuilt as PostStack rules & sequences (see
+2. **Automations / flows** — *not* exportable; rebuilt as Faina rules & sequences (see
    [rebuild-automations.md](rebuild-automations.md)).
 3. **Conversation history** — not migratable (ManyChat exports the current contact state, not full threads).
 
@@ -30,7 +30,7 @@ Anna K,annak_design,anna@example.com,true,"customer,vip",Warsaw
 
 ## 2. Field mapping
 
-| CSV column | PostStack target | Notes |
+| CSV column | Faina target | Notes |
 |------------|------------------|-------|
 | Name | `contacts.display_name` | |
 | Email | `contacts.email` | |
@@ -88,9 +88,9 @@ Tags are created automatically; rows with an unknown channel are reported in `re
 columns become `metadata`), and POSTs in batches:
 
 ```bash
-export POSTSTACK_URL="https://your-instance"
-export POSTSTACK_KEY="sk_live_your_key"
-export POSTSTACK_CHANNEL_ID="<your IG channel id>"
+export FAINA_URL="https://your-instance"
+export FAINA_KEY="sk_live_your_key"
+export FAINA_CHANNEL_ID="<your IG channel id>"
 node docs/migration/import-contacts.mjs path/to/audience.csv
 ```
 
@@ -105,23 +105,23 @@ node docs/migration/import-contacts.mjs path/to/audience.csv
 
 This is the part people worry about most, and it's usually quick. See
 [rebuild-automations.md](rebuild-automations.md) for a side-by-side of common ManyChat flow patterns
-(keyword → DM, comment → DM, story reply) and how to express each as a PostStack rule or sequence.
+(keyword → DM, comment → DM, story reply) and how to express each as a Faina rule or sequence.
 
 ## 6. Stay in sync with your other tools (webhooks)
 
 If you pipe new subscribers into a CRM, an email tool, or a spreadsheet, you don't have to poll. Register
-an outbound webhook (`webhooks:write` scope, Pro) and PostStack will POST you a signed event the moment a
+an outbound webhook (`webhooks:write` scope, Pro) and Faina will POST you a signed event the moment a
 new contact is created — whether from an import, a fresh DM, or a comment:
 
 ```bash
 curl -s -X POST https://your-instance/api/v1/webhooks \
   -H "Authorization: Bearer sk_live_your_key" -H "Content-Type: application/json" \
-  -d '{ "url": "https://your-app.example.com/hooks/poststack", "event_types": ["contact.created"] }'
+  -d '{ "url": "https://your-app.example.com/hooks/faina", "event_types": ["contact.created"] }'
 # → { "data": { "id": "…", "secret": "whsec_…", "event_types": ["contact.created"], "active": true } }
 ```
 
 The response includes the signing `secret` **once** — store it. Every delivery carries
-`X-PostStack-Signature: t=<unix>,v1=<hmac>` (HMAC-SHA256 over `"<timestamp>.<raw-body>"`), so your
+`X-Faina-Signature: t=<unix>,v1=<hmac>` (HMAC-SHA256 over `"<timestamp>.<raw-body>"`), so your
 receiver can verify authenticity and reject replays. Omit `event_types` (or pass `[]`) to receive every
 event type; rotate the secret any time with `POST /api/v1/webhooks/{id}/rotate-secret`. Full schema at
 `/api/docs`.
