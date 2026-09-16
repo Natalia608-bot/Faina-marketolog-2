@@ -1,14 +1,3 @@
-/**
- * PostStack worker (graphile-worker)
- *
- * Run with: npm run worker
- * In production: separate Docker container using Dockerfile.worker
- *
- * Consumes jobs from PostgreSQL (graphile-worker). `run()` installs the
- * graphile_worker schema on startup and installs SIGINT/SIGTERM handlers for
- * graceful shutdown.
- */
-
 import { writeFileSync } from "fs";
 import { run } from "graphile-worker";
 import { createTaskList } from "../src/lib/queue/tasks";
@@ -41,7 +30,7 @@ async function main() {
   });
 
   console.log(
-    `[worker] PostStack worker started. Tasks: ${Object.keys(taskList).join(", ")}`
+    `[worker] Faina worker started. Tasks: ${Object.keys(taskList).join(", ")}`
   );
 
   // Anonymous usage telemetry: log the enabled notice and fire a debounced boot send (fire-and-forget,
