@@ -1,16 +1,17 @@
 {
-  "name": "poststack",
+  "name": "faina",
   "version": "0.13.1",
   "private": false,
   "license": "Elastic-2.0",
   "description": "Self-hosted, source-available social media management for Facebook & Instagram — publish & schedule posts, auto-reply to DMs and comments, and run drip sequences from one place.",
-  "homepage": "https://github.com/jurczykpawel/poststack",
+  "homepage": "https://github.com/jurczykpawel/faina",
   "repository": {
     "type": "git",
-    "url": "https://github.com/jurczykpawel/poststack"
+    "url": "https://github.com/jurczykpawel/faina"
   },
   "scripts": {
     "dev": "bun --watch src/server/index.ts",
+    
     "start": "bun src/server/index.ts",
     "build": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
