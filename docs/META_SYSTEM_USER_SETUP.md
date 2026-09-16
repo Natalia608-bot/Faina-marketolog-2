@@ -1,11 +1,11 @@
 # One Token Setup — connect every Page & Instagram account with a single Meta System User token
 
-This is PostStack's "turbo" onboarding: you deploy on your own VPS, generate **one** permanent
-Meta **System User** token, paste it once, and PostStack automatically connects **every** Facebook
+This is Faina "turbo" onboarding: you deploy on your own VPS, generate **one** permanent
+Meta **System User** token, paste it once, and Faina automatically connects **every** Facebook
 Page and linked Instagram account that the System User can access — and keeps that set in sync.
 
 > This document is written around **invariants** (what is always true about System User tokens and
-> how PostStack consumes them), not around Meta's UI, because Meta moves menus and renames screens
+> how Faina consumes them), not around Meta's UI, because Meta moves menus and renames screens
 > often. The exact button labels you see may differ from any screenshot; the *concepts* below do
 > not. If you get stuck, the **[For agents](#for-agents)** section at the end tells an AI assistant
 > how to walk you through your *current* Meta UI using up-to-date docs and what you see on screen.
@@ -18,7 +18,7 @@ Paste one token →
 
 - Every **Facebook Page** the System User has a role on is connected as a channel.
 - Every **Instagram** business account linked to those Pages is connected.
-- PostStack auto-subscribes each Page's webhooks (no manual webhook wiring per Page).
+- Faina auto-subscribes each Page's webhooks (no manual webhook wiring per Page).
 - A **daily sync** re-enumerates: newly-added Pages appear automatically; removed ones are
   soft-deleted.
 - Because a System User token is **permanent**, there is no 60-day refresh and no ~90-day
@@ -38,7 +38,7 @@ This is the **Managed Connection** feature (PRO). The free tier connects a singl
 ## The mental model — the three things that must be true
 
 Everything below is just a way to satisfy these three invariants. If all three hold, the token
-works; if one is missing, PostStack will tell you which (see [Troubleshooting](#troubleshooting)).
+works; if one is missing, Faina will tell you which (see [Troubleshooting](#troubleshooting)).
 
 1. **It is a Business *System User* token.** A System User is a non-human "service account" that
    lives inside a Meta **Business** (a.k.a. Business Manager / Business Portfolio). Its token is the
@@ -48,11 +48,11 @@ works; if one is missing, PostStack will tell you which (see [Troubleshooting](#
 
 2. **The System User can reach your assets *and* your app.** Inside the Business, the System User
    must have **your Facebook Pages assigned** to it (which carries the linked Instagram accounts),
-   **and** your PostStack **Meta app assigned** to it. Assigning the assets is what makes them show
+   **and** your Faina **Meta app assigned** to it. Assigning the assets is what makes them show
    up; assigning the app is what lets you mint a token *for that app*.
 
 3. **The token is generated for *your* app, with the right permissions, and set to never expire.**
-   The token must be minted against the same app whose `META_APP_ID` / `META_APP_SECRET` PostStack
+   The token must be minted against the same app whose `META_APP_ID` / `META_APP_SECRET` Faina
    uses, must carry the permissions listed below, and should be generated with the **"never" /
    no-expiration** option.
 
@@ -63,7 +63,7 @@ works; if one is missing, PostStack will tell you which (see [Troubleshooting](#
 When you generate the System User token, grant these scopes. The names are Meta **Graph API
 permission** identifiers — they are part of the API contract and change far less often than the UI.
 
-| Permission | Why PostStack needs it |
+| Permission | Why Faina needs it |
 |---|---|
 | `pages_show_list` | Enumerate the Pages behind the token (the core of "connect everything"). **Required** — without it nothing connects. |
 | `pages_messaging` | Receive & send Facebook Messenger DMs (inbox + auto-reply + comment→DM private replies). |
@@ -101,7 +101,7 @@ menu names may differ in your version of the UI.
    Manager / Business Portfolio), create one and **add your Facebook Page(s)** to it. Linked
    Instagram business accounts come along with their Page.
 
-2. **Add your PostStack Meta app to the Business.** The app is the one you created in
+2. **Add your Faina Meta app to the Business.** The app is the one you created in
    [README → Meta App Setup](../README.md#meta-app-setup) (the one whose App ID/Secret are in your
    `.env`). It must belong to / be claimed by the same Business.
 
@@ -113,26 +113,26 @@ menu names may differ in your version of the UI.
    control over the Pages.
 
 5. **Generate a token for the System User:**
-   - choose **your PostStack app** as the app the token is for,
+   - choose **your Faina app** as the app the token is for,
    - set expiration to **Never** (this is what makes it permanent),
    - select the **permissions** from the table above,
    - generate and copy the token. **Copy it immediately** — Meta shows it once.
 
-6. **Paste it into PostStack:** open your instance → the **Sources / Connections** area (Settings) →
+6. **Paste it into Faina:** open your instance → the **Sources / Connections** area (Settings) →
    "connect a managed source" → paste the token. (Or via the API: `POST /api/v1/sources` with the
    token, using an API key that has the `sources:write` scope.)
 
-That's it. PostStack validates the token, enumerates everything, and mints the channels.
+That's it. Faina validates the token, enumerates everything, and mints the channels.
 
 ---
 
 ## What success looks like
 
-After pasting, PostStack shows the source with a badge. **The badge is your diagnostic** — it
+After pasting, Faina shows the source with a badge. **The badge is your diagnostic** — it
 reflects what Meta's `debug_token` actually reports about your token:
 
 - ✅ **"System User (permanent) · data access never expires"** — perfect. This is the permanent,
-  set-and-forget shape. PostStack detects it as a System User token because Meta reports it as a
+  set-and-forget shape. Faina detects it as a System User token because Meta reports it as a
   USER-type token with **no death clock and no data-access wall**.
 - ⚠️ **"User token · data access until <date>"** — this is **not** a permanent System User token.
   Either you pasted a personal-login token, or the System User token was generated **with** an
@@ -147,13 +147,13 @@ the source).
 
 ## Troubleshooting
 
-PostStack rejects a bad token **up front** with a specific message (these strings are stable — they
-come from PostStack, not Meta):
+Faina rejects a bad token **up front** with a specific message (these strings are stable — they
+come from Faina, not Meta):
 
 | Message | Meaning & fix |
 |---|---|
 | *"This token is missing permissions required for …: `<list>`."* | The token wasn't generated with all required scopes. Regenerate it and tick the missing permissions. |
-| *"This access token belongs to a different Facebook app. Generate a token for THIS app."* | The token was minted for another app. Generate it against the app whose `META_APP_ID` PostStack uses. |
+| *"This access token belongs to a different Facebook app. Generate a token for THIS app."* | The token was minted for another app. Generate it against the app whose `META_APP_ID` Faina uses. |
 | *"This access token is invalid or expired. Generate a fresh token and try again."* | The token is revoked/expired. Mint a fresh one (and set expiry to Never). |
 | *"This token did not resolve to a Meta account. Paste a User or System User token."* | You likely pasted a Page token or a malformed string. Paste the **System User** token. |
 | *"Could not read the account this token belongs to …"* | Transient Meta/network issue, or a bad token. Retry; if it persists, regenerate. |
@@ -161,7 +161,7 @@ come from PostStack, not Meta):
 | A Page or IG account is **missing** from the connected list | The System User doesn't have that asset assigned, or lacks full control. Assign it in the Business and re-sync. |
 | IG account missing for a Page that *is* connected | The Page has no **linked Instagram business account**, or `instagram_basic` wasn't granted. Link the IG account to the Page (Instagram must be a *business/creator* account) and ensure the scope is present. |
 
-> **Why PostStack can validate this at all:** when app credentials are configured it calls Meta's
+> **Why Faina can validate this at all:** when app credentials are configured it calls Meta's
 > `GET /debug_token` to read the token's app, validity, both expiry clocks, and granted scopes —
 > so it can tell you *exactly* what's wrong instead of a generic failure. If app credentials aren't
 > set yet, validation is skipped and the connect is attempted directly.
@@ -184,11 +184,11 @@ If a user asks you to help set up the one-token / System User connection, follow
 - **Ask the user what they see.** Have them tell you the exact section/button labels on their
   screen and map those to the invariants, rather than assuming the labels. Iterate on their
   feedback.
-- **Use PostStack's own signals as ground truth.** The paste-time error messages and the source
+- **Use Faina own signals as ground truth.** The paste-time error messages and the source
   badge ("System User (permanent)" vs "User token · data access until …") tell you precisely
   whether the token satisfies the invariants. Treat the badge as the success check.
 - **Never ask the user to paste the raw token into the chat.** It is a long-lived credential — they
-  should paste it only into their PostStack instance. Help them verify via the badge and error
+  should paste it only into their Faina instance. Help them verify via the badge and error
   messages, not by reading the token.
 - **Confirm the required scopes** from the [permissions table](#required-permissions-on-the-token)
   against the current Meta permission reference; if Meta has renamed or split a permission, prefer
