@@ -8,7 +8,7 @@
 export const TIERS = ["free", "registered", "pro", "business"] as const;
 export type Tier = (typeof TIERS)[number];
 
-const RANK: Record<Tier, number> = { free: 0, registered: 1, business: 3 };
+const RANK: Record<Tier, number> = { free: 0, registered: 1, pro: 2, business: 3 };
 
 /** Rank of any tier string; unknown / empty / null → free (0). Case-insensitive. */
 export function tierRank(tier: string | null | undefined): number {
