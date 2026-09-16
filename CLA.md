@@ -1,6 +1,6 @@
 # Contributor License Agreement
 
-Thank you for contributing to PostStack. To keep the project's licensing flexible
+Thank you for contributing to Faina. To keep the project's licensing flexible
 (for example, so it can move to a more permissive license in the future), we ask
 every contributor to agree to the terms below. By submitting a contribution
 (a pull request, patch, or any code/content) to this project, you agree to this
