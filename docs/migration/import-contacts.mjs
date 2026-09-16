@@ -1,25 +1,25 @@
 #!/usr/bin/env node
-// Reference importer: a ManyChat / Chatfuel audience CSV -> PostStack contacts.
+// Reference importer: a ManyChat / Chatfuel audience CSV -> Faina contacts.
 // Maps each row to a contact (handle as placeholder sender id), batches them through
 // POST /api/v1/contacts (idempotent: re-runs update, never duplicate), and reports per-row failures.
 //
 // Plain Node 18+ (built-in fetch), no dependencies. Adapt the header aliases below to your export.
 // The contacts CRM is a Pro feature — the endpoint requires a Pro license. See docs/migration/from-manychat.md.
 //
-//   export POSTSTACK_URL="https://your-instance"
-//   export POSTSTACK_KEY="sk_live_your_key"
-//   export POSTSTACK_CHANNEL_ID="<the IG/FB channel id these contacts belong to>"
+//   export FAINA_URL="https://your-instance"
+//   export FAINA_KEY="sk_live_your_key"
+//   export FAINA_CHANNEL_ID="<the IG/FB channel id these contacts belong to>"
 //   node import-contacts.mjs path/to/audience.csv
 
 import { readFile } from "node:fs/promises";
 
-const BASE = process.env.POSTSTACK_URL;
-const KEY = process.env.POSTSTACK_KEY;
-const CHANNEL_ID = process.env.POSTSTACK_CHANNEL_ID;
+const BASE = process.env.FAINA_URL;
+const KEY = process.env.FAINA_KEY;
+const CHANNEL_ID = process.env.FAINA_CHANNEL_ID;
 const FILE = process.argv[2];
 
 if (!BASE || !KEY || !CHANNEL_ID || !FILE) {
-  console.error("Set POSTSTACK_URL, POSTSTACK_KEY, POSTSTACK_CHANNEL_ID and pass a CSV path.");
+  console.error("Set FAINA_URL, FAINA_KEY, FAINA_CHANNEL_ID and pass a CSV path.");
   process.exit(1);
 }
 
