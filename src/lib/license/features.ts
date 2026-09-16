@@ -1,12 +1,3 @@
-// The single source of truth for what's gated: one registry array, each row tagging a feature with
-// its functional AREA (publishing / replies / core), the minimum TIER that unlocks it, a status, and
-// user-facing copy. Licensing a NEW feature = add one row here + one requireFeature()/hasFeature() at
-// the call-site. The `Feature` union is DERIVED from this array, so call-sites stay type-checked and
-// the registry can never drift from the type.
-//
-// `area` is the second entitlement dimension: a license entitles a set of areas (from the signed
-// token), and a feature is granted only when the tier meets minTier AND its area is entitled. `core`
-// is always entitled. `status: "live"` is enforced now; `"planned"` is reserved on the roadmap.
 import type { Tier } from "./tiers";
 import { meetsTier, normalizeTier } from "./tiers";
 import type { Area } from "./areas";
@@ -34,20 +25,18 @@ export const FEATURES = [
   { key: "manual_reply", area: "replies", minTier: "free", status: "live", label: "Replying to conversations by hand (rules still auto-reply for free)", description: "A human typing a reply in the inbox / via the API. Free = rules auto-reply only." },
   { key: "reaction_trigger", area: "replies", minTier: "free", status: "live", label: "Auto-replies triggered by a message reaction", description: "Rules that fire on a message reaction (free triggers are keyword/comment only)." },
 
-  // ── core (connection / access infra shared by both wings) ───────────────────────────────────
-  { key: "managed_connection", area: "core", minTier: "pro", status: "live", label: "Meta managed connection (one token connects all Pages + Instagram)", description: "Connect one master FB/IG token that auto-enumerates Pages and linked Instagram accounts, mints and refreshes their tokens automatically." },
-  { key: "api_access", area: "core", minTier: "pro", status: "live", label: "API access (REST API keys)", description: "Programmatic REST access via API keys (the dashboard uses session auth, unaffected)." },
-  { key: "webhook_insights", area: "core", minTier: "pro", status: "live", label: "Webhook delivery stats", description: "Aggregate counts of inbound webhook events by outcome (delivered, auto-replied, errors) on the Webhooks page." },
-  // multitenancy is owner-only for now: pro (sold today) must NOT unlock it — business only.
-  { key: "multi_workspace", area: "core", minTier: "business", status: "live", label: "Multiple workspaces", description: "Run more than one isolated workspace (multi-tenant / agency)." },
+  { key: "managed_connection", area: "core", minTier: "free", status: "live", label: "Meta managed connection (one token connects all Pages + Instagram)", description: "Connect one master FB/IG token that auto-enumerates Pages and linked Instagram accounts, mints and refreshes their tokens automatically." },
+  { key: "api_access", area: "core", minTier: "free", status: "live", label: "API access (REST API keys)", description: "Programmatic REST access via API keys (the dashboard uses session auth, unaffected)." },
+  { key: "webhook_insights", area: "core", minTier: "free", status: "live", label: "Webhook delivery stats", description: "Aggregate counts of inbound webhook events by outcome (delivered, auto-replied, errors) on the Webhooks page." },
+ 
+  { key: "multi_workspace", area: "core", minTier: "free", status: "live", label: "Multiple workspaces", description: "Run more than one isolated workspace (multi-tenant / agency)." },
 
-  // ── publishing wing (PostStack feature set — placeholders wired up in Phase 1/3) ─────────────
-  { key: "multi_brand", area: "publishing", minTier: "pro", status: "live", label: "Multiple brands", description: "Manage more than one brand — run it as an agency or across projects." },
-  { key: "webhook_filtering", area: "publishing", minTier: "pro", status: "live", label: "Webhook event filtering", description: "Restrict an outbound webhook to specific event types. An endpoint with no filter receives every event type." },
-  { key: "auto_story", area: "publishing", minTier: "pro", status: "live", label: "Auto-Story", description: "Auto-publish a generated Story card about every post published to a channel." },
-  { key: "first_comment", area: "publishing", minTier: "pro", status: "live", label: "Automatic first comment", description: "Auto-post a first comment (e.g. “link in the comments”) under every published post." },
-  { key: "multi_api_key", area: "core", minTier: "pro", status: "live", label: "Multiple API keys", description: "Issue more than one API key (e.g. one per client/integration)." },
-  { key: "outbound_webhooks", area: "core", minTier: "pro", status: "live", label: "Outbound webhooks", description: "Subscribe an external URL to events (contact.created, post.published, …), delivered HMAC-signed with retry. Like API access, this is a programmatic integration capability." },
+  { key: "multi_brand", area: "publishing", minTier: "free", status: "live", label: "Multiple brands", description: "Manage more than one brand — run it as an agency or across projects." },
+  { key: "webhook_filtering", area: "publishing", minTier: "free", status: "live", label: "Webhook event filtering", description: "Restrict an outbound webhook to specific event types. An endpoint with no filter receives every event type." },
+  { key: "auto_story", area: "publishing", minTier: "free", status: "live", label: "Auto-Story", description: "Auto-publish a generated Story card about every post published to a channel." },
+  { key: "first_comment", area: "publishing", minTier: "free", status: "live", label: "Automatic first comment", description: "Auto-post a first comment (e.g. “link in the comments”) under every published post." },
+  { key: "multi_api_key", area: "core", minTier: "free", status: "live", label: "Multiple API keys", description: "Issue more than one API key (e.g. one per client/integration)." },
+  { key: "outbound_webhooks", area: "core", minTier: "free", status: "live", label: "Outbound webhooks", description: "Subscribe an external URL to events (contact.created, post.published, …), delivered HMAC-signed with retry. Like API access, this is a programmatic integration capability." },
 ] as const satisfies readonly FeatureDef[];
 
 /** Gateable feature keys — the union is derived from the registry, so it can never drift. */
@@ -70,7 +59,7 @@ export function featureArea(key: Feature): Area {
 
 /**
  * The set of feature keys a tier unlocks (independent of area — area entitlement is applied in the
- * gate). Unknown / null tiers degrade to free, which grants nothing (every feature is minTier >= pro).
+ * gate). Unknown / null tiers degrade to free, which grants nothing.
  */
 export function tierFeatures(tier: string | null): Set<Feature> {
   if (!tier) return new Set();
@@ -83,7 +72,7 @@ export function tierFeatures(tier: string | null): Set<Feature> {
 export function proMessage(feature: Feature): string {
   const f = BY_KEY.get(feature);
   const label = f?.label ?? feature;
-  const tier = (f?.minTier ?? "pro").toUpperCase();
+  const tier = (f?.minTier ??).toUpperCase();
   if (f?.area === "publishing") return `${label} requires a ${tier} license with the publishing product.`;
   if (f?.area === "replies") return `${label} requires a ${tier} license with the replies product.`;
   return `${label} requires a ${tier} license.`;
