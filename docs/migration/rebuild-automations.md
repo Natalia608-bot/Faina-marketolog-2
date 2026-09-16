@@ -1,7 +1,7 @@
-# Rebuilding your ManyChat automations in PostStack
+# Rebuilding your ManyChat automations in Faina
 
 ManyChat flows can't be exported as data, so you rebuild them — but the common patterns map cleanly onto
-PostStack **rules** (single keyword → response) and **sequences** (multi-step drips). Most people port
+Faina **rules** (single keyword → response) and **sequences** (multi-step drips). Most people port
 their core automations in well under an hour.
 
 Rules are created with `POST /api/v1/rules` (scope `rules:write`). Unlike the publishing API, the rules
@@ -9,7 +9,7 @@ body is **snake_case**. Browse the full schema interactively at `/api/docs`.
 
 ## Pattern map
 
-| ManyChat flow | PostStack equivalent |
+| ManyChat flow | Faina equivalent |
 |---------------|----------------------|
 | Keyword growth tool (DM a keyword → auto-reply) | Rule, `trigger_type: "keyword"` |
 | Instagram comment automation (comment a word → DM) | Rule, `trigger_type: "comment_keyword"` |
