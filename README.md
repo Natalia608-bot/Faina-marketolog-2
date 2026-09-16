@@ -1,7 +1,4 @@
 
-
-## Features
-
 ### Messaging
 - **Auto-reply rules** -- triggers for keywords (exact, contains, starts with), comment keywords, postbacks, welcome messages, story replies/mentions, emoji reactions, and fallback/default
 - **Comment automation** -- reply publicly under the comment, send a private DM (Meta `private_replies`), or both -- scoped to a specific post or all posts, on Facebook **and** Instagram
@@ -43,7 +40,7 @@
 
 ### Telemetry & privacy
 
-PostStack sends a small **anonymous** usage report to the maintainer once per day (and once on startup). It contains only aggregate counts (workspaces, channels, messages sent, webhooks processed, response-time aggregates…) and deployment shape (app version, runtime, OS/arch, which platforms are connected, integration on/off flags). It carries no message content, no contact data, no tokens or secrets, and no raw domain — the only identifiers are a random instance id and salted one-way hashes. Telemetry is on by default; disable it any time with `POSTSTACK_TELEMETRY_DISABLED=true`. Full detail: [docs/PRIVACY.md](docs/PRIVACY.md).
+Faina sends a small **anonymous** usage report to the maintainer once per day (and once on startup). It contains only aggregate counts (workspaces, channels, messages sent, webhooks processed, response-time aggregates…) and deployment shape (app version, runtime, OS/arch, which platforms are connected, integration on/off flags). It carries no message content, no contact data, no tokens or secrets, and no raw domain — the only identifiers are a random instance id and salted one-way hashes. Telemetry is on by default; disable it any time with `FAINA_TELEMETRY_DISABLED=true`. Full detail: [docs/PRIVACY.md](docs/PRIVACY.md).
 
 ---
 
@@ -57,8 +54,8 @@ PostStack sends a small **anonymous** usage report to the maintainer once per da
 > it locally / developing.
 
 ```bash
-git clone https://github.com/jurczykpawel/poststack.git
-cd poststack
+git clone https://github.com/jurczykpawel/Faina.git
+cd Faina
 cp .env.example .env
 ```
 
@@ -121,24 +118,24 @@ Register an account, go to **Channels**, and connect your first Facebook Page or
 
 If you don't want to manage `.env`, secrets, and a TLS proxy by hand, deploy with
 **[StackPilot](https://github.com/jurczykpawel/stackpilot)** — a self-host toolbox that installs
-PostStack and **wires up Cloudflare/Caddy + HTTPS for you** (so the TLS requirement below is handled
+Faina and **wires up Cloudflare/Caddy + HTTPS for you** (so the TLS requirement below is handled
 automatically). It generates every secret (`ENCRYPTION_KEY`, `JWT_SECRET`, `CRON_SECRET`,
 `ALTCHA_HMAC_KEY`, the Postgres password), brings up the full stack (nginx + web + worker +
 PostgreSQL) from the public GHCR images, and runs the database migrations:
 
 ```bash
 # Fully managed — app + a Cloudflare/Caddy domain with TLS, in one command:
-./local/deploy.sh poststack --domain-type=cloudflare --domain=inbox.example.com
+./local/deploy.sh Faina --domain-type=cloudflare --domain=inbox.example.com
 
 # Or, on the server itself (installs the stack with auto-generated secrets;
 # then point your own reverse proxy / Cloudflare at it for HTTPS):
-curl -fsSL https://stackpilot.techskills.academy/poststack | bash
+curl -fsSL https://stackpilot.techskills.academy/faina | bash
 ```
 
 Then open `https://inbox.example.com/register` to create the owner account and connect Meta in
 **Settings** — no `.env` editing, no manual TLS. Re-running the installer preserves your existing
 `.env` (so `ENCRYPTION_KEY` stays stable and stored tokens keep decrypting), and
-`./local/deploy.sh poststack --update` pulls the latest image. Connect a Meta app and Google/YouTube
+`./local/deploy.sh Faina --update` pulls the latest image. Connect a Meta app and Google/YouTube
 later from the dashboard.
 
 Prefer to wire everything yourself? Use the manual flow below.
@@ -159,7 +156,7 @@ This runs nginx (port 80) + the Hono web server + graphile-worker + PostgreSQL w
 >
 > Either way, set `APP_URL` to the public **`https://`** URL — it drives the OAuth redirect URIs and the webhook callback. Don't expose the app/nginx directly on the internet without TLS + a proxy that overwrites the client-IP headers.
 
-> **Images & registry.** Pulls the public images `ghcr.io/jurczykpawel/poststack` and `…-worker` — no auth needed. **Pin `IMAGE_TAG`** to a released version (e.g. `v0.7.1`, not `latest`) so upgrades and rollbacks are intentional and predictable. Forks: set `IMAGE_REPO` in `.env` to your own registry path.
+> **Images & registry.** Pulls the public images `ghcr.io/jurczykpawel/Faina` and `…-worker` — no auth needed. **Pin `IMAGE_TAG`** to a released version (e.g. `v0.7.1`, not `latest`) so upgrades and rollbacks are intentional and predictable. Forks: set `IMAGE_REPO` in `.env` to your own registry path.
 
 > **Rollback.** Pin the last good version and bring the stack back up — pinning `IMAGE_TAG` to an explicit version (not `latest`) is what makes rollbacks predictable:
 > ```bash
@@ -216,12 +213,12 @@ re-encrypt every `channels.token_encrypted` under the new key (in a maintenance 
    - `https://your-domain.com/api/oauth/facebook/callback`
    - `https://your-domain.com/api/oauth/instagram/callback`
 4. Add the **Messenger** and **Instagram** products.
-5. In **Webhooks**, set the callback URL to `https://your-domain.com/api/webhooks/meta` and the verify token to match `META_WEBHOOK_VERIFY_TOKEN` in your `.env`, then subscribe to: `messages`, `messaging_postbacks`, `feed` (PostStack auto-subscribes each connected Page to the fields it needs; check **Webhooks → Subscriptions** in the dashboard for active-vs-expected status).
+5. In **Webhooks**, set the callback URL to `https://your-domain.com/api/webhooks/meta` and the verify token to match `META_WEBHOOK_VERIFY_TOKEN` in your `.env`, then subscribe to: `messages`, `messaging_postbacks`, `feed` (Faina auto-subscribes each connected Page to the fields it needs; check **Webhooks → Subscriptions** in the dashboard for active-vs-expected status).
 
 **Note:** your `APP_URL` must be public **HTTPS** (see [Production → HTTPS](#production)) — Meta rejects `http://` and `localhost` for OAuth redirects and webhooks. For local testing, expose your dev server with a tunnel (`cloudflared tunnel --url http://localhost:3000` or `npx ngrok http 3000`) and use that HTTPS URL. Some permissions require Meta App Review for production; in development mode you can test with your own accounts without review.
 
 > **One-token setup (recommended for self-host):** instead of connecting Pages one by one, paste a
-> single permanent Meta **System User** token and PostStack auto-connects every Page + linked
+> single permanent Meta **System User** token and Faina auto-connects every Page + linked
 > Instagram account it can reach, and keeps them in sync. Full guide:
 > **[docs/META_SYSTEM_USER_SETUP.md](docs/META_SYSTEM_USER_SETUP.md)**.
 
@@ -257,7 +254,7 @@ merging its PR.
 ## Meta Access Levels — what needs App Review (and what doesn't)
 
 **Short answer:** if you self-host and only operate **your own** Facebook Pages / Instagram
-accounts, you do **not** need Meta App Review or Business Verification. Every PostStack feature
+accounts, you do **not** need Meta App Review or Business Verification. Every Faina feature
 works under **Standard Access**, which every app has by default. App Review only becomes relevant
 when you start operating accounts that belong to **other people** (a multi-client / agency setup).
 
@@ -271,7 +268,7 @@ Meta gates every permission behind one of two tiers:
 | **Advanced Access** | The same permission, but usable with users who do **NOT** have a role on your app — i.e. the general public / other people's accounts. | **App Review** + **Business Verification**. |
 
 When you create your own Meta app you are automatically its **Admin**, and the Pages / IG accounts
-you connect are ones you manage. So every permission PostStack requests resolves at **Standard
+you connect are ones you manage. So every permission Faina requests resolves at **Standard
 Access** — no review needed. That is why all the inbox / auto-reply / comment features work on your
 own accounts **without App Review**.
 
@@ -289,9 +286,9 @@ own accounts **without App Review**.
 > permissions, which means App Review + Business Verification. This is exactly what a managed /
 > reseller offering (the "connect under one verified app" model) requires.
 
-### Per-feature map (the permissions PostStack actually requests)
+### Per-feature map (the permissions Faina actually requests)
 
-PostStack requests only these scopes — Facebook: `pages_show_list`, `pages_messaging`,
+Faina requests only these scopes — Facebook: `pages_show_list`, `pages_messaging`,
 `pages_read_engagement`, `pages_manage_metadata`; Instagram additionally: `instagram_basic`,
 `instagram_manage_messages`, `instagram_manage_comments`.
 
@@ -333,7 +330,7 @@ accounts with no review.
 
 ### Other channels — same story
 
-This isn't unique to Meta. **None of PostStack's currently-supported channels require a lengthy
+This isn't unique to Meta. **None of Faina's currently-supported channels require a lengthy
 review or identity/business verification to run on your own accounts** — only the normal,
 self-service developer-app configuration:
 
@@ -355,7 +352,7 @@ To enable Gmail mailbox support, create a Google Cloud OAuth app:
    - **Application type:** Web application
    - **Authorized redirect URIs:** add `https://your-domain.com/api/oauth/gmail/callback` (use your real `APP_URL`)
 4. Copy the **Client ID** and **Client Secret** into `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET` in your `.env` (or set them in Settings → OAuth after first login).
-5. **OAuth scope:** PostStack requests `openid`, `email`, `https://www.googleapis.com/auth/gmail.readonly`, `https://www.googleapis.com/auth/gmail.send` — read-only ingest and send.
+5. **OAuth scope:** Faina requests `openid`, `email`, `https://www.googleapis.com/auth/gmail.readonly`, `https://www.googleapis.com/auth/gmail.send` — read-only ingest and send.
 
 **Verification note:** Google restricts these scopes. An **unverified app** can only authorize the developer's own Gmail account + ~100 test users. To **serve external mailboxes** (real multi-tenant usage), your Google app must pass **OAuth verification** and **Google's CASA security assessment** (annual; separate fee). For **self-hosting your own team's Gmail**, add your account as a test user — no assessment needed.
 
@@ -366,7 +363,7 @@ To enable Gmail mailbox support, create a Google Cloud OAuth app:
 > verification still works for your own/test-user accounts (with the unverified-app warning, capped
 > at ~100 users); verification + CASA is only needed to lift that cap for external mailboxes.
 
-**Optional:** each Gmail channel can use an ingest filter (e.g. `label:support`, `is:unread`, `-category:promotions`) to narrow the messages PostStack polls. Set it in the dashboard or via the API when connecting the channel.
+**Optional:** each Gmail channel can use an ingest filter (e.g. `label:support`, `is:unread`, `-category:promotions`) to narrow the messages Faina polls. Set it in the dashboard or via the API when connecting the channel.
 
 The same Google app can also serve **YouTube** (`youtube` platform) — just add the YouTube channel to the app and use the same `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`.
 
@@ -378,7 +375,7 @@ TikTok is supported as a **publishing** channel, with one important limitation t
 
 TikTok only allows **direct, fully-automated publishing** for apps that have passed its
 **content-posting audit**. Until an app is audited, TikTok's Content Posting API is restricted to the
-**inbox / draft** flow: PostStack uploads your video to your TikTok **inbox as a draft**, and you open
+**inbox / draft** flow: Faina uploads your video to your TikTok **inbox as a draft**, and you open
 the TikTok app to set the caption, cover and privacy and tap publish. Unaudited apps are also capped
 to **private (`SELF_ONLY`)** visibility. So scheduling a TikTok post lands a ready-to-confirm draft in
 your inbox — it is **not** a hands-off auto-publish, and **full automation isn't possible yet**.
@@ -411,7 +408,7 @@ Go to **Rules** and click **+ New Rule**:
 - **Priority** -- higher = checked first (rules are evaluated top to bottom)
 - **Cooldown** -- minimum seconds between fires for the same contact
 
-For comment automation, use "Keyword (Comment)" trigger -- when someone comments a keyword on your post, PostStack sends them a DM.
+For comment automation, use "Keyword (Comment)" trigger -- when someone comments a keyword on your post, Faina sends them a DM.
 
 ### 3. View conversations
 
@@ -510,7 +507,7 @@ GET /api/cron/token-refresh      incoming-reaction   ──> reaction rule eval
 
 ## API
 
-PostStack exposes its operational data and automation through REST. Interactive channel connection
+Faina exposes its operational data and automation through REST. Interactive channel connection
 and reconnection remain logged-in dashboard actions because they involve browser redirects and
 third-party consent.
 
@@ -671,16 +668,16 @@ git commit -m "feat: your feature"
 
 ## Support
 
-PostStack's core is free and self-hosted. If it replaced a scheduler subscription for
+Faina core is free and self-hosted. If it replaced a scheduler subscription for
 you — Meta changes its API at 2 a.m. and pizza helps keeping up:
 
-[![🍕 Buy me a pizza](https://img.shields.io/badge/🍕_Buy_me_a_pizza-FFDD00)](https://sellf.techskills.academy/checkout/tip-poststack?utm_source=github&utm_medium=readme&utm_campaign=tip-jar)
+[![🍕 Buy me a pizza](https://img.shields.io/badge/🍕_Buy_me_a_pizza-FFDD00)](https://sellf.techskills.academy/checkout/tip-Faina?utm_source=github&utm_medium=readme&utm_campaign=tip-jar)
 
 ## License
 
 [Elastic License 2.0](LICENSE) — source-available.
 
-You're free to self-host, use, modify, and redistribute PostStack. The only limits: you may **not** offer it to third parties as a hosted/managed service, and you may **not** circumvent the license-key functionality. Self-hosting it for your own business is always free. For a commercial/managed-service license, get in touch.
+You're free to self-host, use, modify, and redistribute Faina. The only limits: you may **not** offer it to third parties as a hosted/managed service, and you may **not** circumvent the license-key functionality. Self-hosting it for your own business is always free. For a commercial/managed-service license, get in touch.
 
 ---
 
