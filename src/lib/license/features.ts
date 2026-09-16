@@ -72,7 +72,7 @@ export function tierFeatures(tier: string | null): Set<Feature> {
 export function proMessage(feature: Feature): string {
   const f = BY_KEY.get(feature);
   const label = f?.label ?? feature;
-  const tier = (f?.minTier ??).toUpperCase();
+  const tier = (f?.minTier ?? "free").toUpperCase();
   if (f?.area === "publishing") return `${label} requires a ${tier} license with the publishing product.`;
   if (f?.area === "replies") return `${label} requires a ${tier} license with the replies product.`;
   return `${label} requires a ${tier} license.`;
