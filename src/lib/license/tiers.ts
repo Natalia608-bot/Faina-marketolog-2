@@ -2,13 +2,13 @@
  * The license tier ladder, low → high. Rank-based, so adding a tier is one array entry and everything
  * compares relatively. Reserved (no features assigned yet, can hold some later):
  *   - `registered` — a free Sellf account (a license with no paid tier) → above anonymous `free`.
- *   - `business`   — multi-tenant / agency, above `pro`.
+ *   - `business`   — multi-tenant / agency, above.
  * A Sellf `tier` claim maps onto this; anonymous self-host (no license) resolves to `free`.
  */
-export const TIERS = ["free", "registered", "pro", "business"] as const;
+export const TIERS = ["free", "registered", "business"] as const;
 export type Tier = (typeof TIERS)[number];
 
-const RANK: Record<Tier, number> = { free: 0, registered: 1, pro: 2, business: 3 };
+const RANK: Record<Tier, number> = { free: 0, registered: 1, business: 3 };
 
 /** Rank of any tier string; unknown / empty / null → free (0). Case-insensitive. */
 export function tierRank(tier: string | null | undefined): number {
