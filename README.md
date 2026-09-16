@@ -1,38 +1,4 @@
-# PostStack
 
-> Self-hosted social media management for Facebook, Instagram, YouTube, Telegram & Gmail -- publish & schedule posts, auto-reply to DMs, comments and emails, and run drip sequences, all from one place.
-
-[![License: Elastic 2.0](https://img.shields.io/badge/License-Elastic_2.0-0077CC.svg)](LICENSE)
-[![CI](https://github.com/jurczykpawel/poststack/actions/workflows/ci.yml/badge.svg)](https://github.com/jurczykpawel/poststack/actions/workflows/ci.yml)
-[![Node.js](https://img.shields.io/badge/node-%3E%3D22.12-brightgreen)](https://nodejs.org)
-[![Source Available](https://img.shields.io/badge/source-available-brightgreen)](LICENSE)
-
-[API Docs](/api/docs) | [Issues](https://github.com/jurczykpawel/poststack/issues) | [Contributing](CONTRIBUTING.md)
-
-> [!TIP]
-> ### ✅ No verified / approved Meta app required
-> To run PostStack on your **own** Facebook & Instagram accounts you do **not** need to pass **Meta
-> App Review** or **Business Verification**. Every feature — inbox, auto-reply, comment→DM, drip
-> sequences — works under Meta's default **Standard Access**. App Review is only needed if you
-> operate **other people's** accounts (an agency / reseller setup).
->
-> 👉 **[Meta Access Levels — what needs App Review (and what doesn't)](#meta-access-levels--what-needs-app-review-and-what-doesnt)**
-
----
-
-## Why PostStack?
-
-- **Self-hosted** -- your data stays on your server, not on someone else's SaaS
-- **No per-contact fees** -- ManyChat charges $15-65/mo and scales with your audience. PostStack is a flat self-hosted cost, free to run yourself
-- **No vendor lock-in** -- export your data, switch providers, fork the code
-- **API-first operations** -- publishing, inbox, CRM, rules, and automation are available via REST for custom frontends and n8n/Zapier; interactive account connection stays in the logged-in dashboard
-- **Extensible** -- add new platforms (Telegram, TikTok) by implementing one TypeScript class
-
-**Alternative to:** ManyChat, Chatfuel, ZernFlow
-
-**For:** solopreneurs, agencies, and developers who want full control over their social media automation.
-
----
 
 ## Features
 
@@ -40,7 +6,7 @@
 - **Auto-reply rules** -- triggers for keywords (exact, contains, starts with), comment keywords, postbacks, welcome messages, story replies/mentions, emoji reactions, and fallback/default
 - **Comment automation** -- reply publicly under the comment, send a private DM (Meta `private_replies`), or both -- scoped to a specific post or all posts, on Facebook **and** Instagram
 - **AI rephrasing** -- optionally rewrite any reply (including a random pool) through an OpenAI-compatible endpoint before sending
-- **AI-drafted replies** (PRO) -- when no auto-reply rule matches an incoming comment/DM and the channel has AI-draft enabled, an LLM prepares a draft reply for human approval; plus an on-demand "Generate reply" button in the inbox. Drafts are reviewed/edited/accepted/rejected in the inbox thread (and the Approvals tab) -- **never auto-sent by default**; optional per-channel auto-send toggles (DM / public, default off, consent-gated). Uses the same `AI_*` config (**BYOK**); daily budget via `AI_DRAFT_DAILY_LIMIT` (default 0 = unlimited)
+- **AI-drafted replies**  -- when no auto-reply rule matches an incoming comment/DM and the channel has AI-draft enabled, an LLM prepares a draft reply for human approval; plus an on-demand "Generate reply" button in the inbox. Drafts are reviewed/edited/accepted/rejected in the inbox thread (and the Approvals tab) -- **never auto-sent by default**; optional per-channel auto-send toggles (DM / public, default off, consent-gated). Uses the same `AI_*` config (**BYOK**); daily budget via `AI_DRAFT_DAILY_LIMIT` (default 0 = unlimited)
 - **Live inbox** -- manage all conversations, reply manually, assign to team members
 - **Drip sequences** -- timed message series with configurable delays between steps
 
@@ -65,7 +31,7 @@
 **Production hardening notes:**
 - **Client IP / rate limiting** — the client IP is taken from the reverse proxy's `X-Real-IP` (the bundled nginx sets it and strips any client-supplied `CF-Connecting-IP`). Set `TRUSTED_PROXY=cloudflare` *only* when actually behind Cloudflare. Don't expose the app directly without a proxy that overwrites these headers.
 - **CAPTCHA** — set `ALTCHA_HMAC_KEY` in production. Empty = verification skipped (dev only). Solved challenges are single-use.
-- **AI rephrase / AI-drafted replies** — `AI_API_KEY` (legacy `OPENAI_API_KEY`) sends reply text to that provider; mind GDPR (use a self-hosted/DPA endpoint via `AI_BASE_URL`). AI-drafted replies (`ai_draft` PRO feature) reuse the same `AI_*` config (BYOK); cap generations per workspace over a rolling 24h window with `AI_DRAFT_DAILY_LIMIT` (default `0` = unlimited).
+- **AI rephrase / AI-drafted replies** — `AI_API_KEY` (legacy `OPENAI_API_KEY`) sends reply text to that provider; mind GDPR (use a self-hosted/DPA endpoint via `AI_BASE_URL`). AI-drafted replies (`ai_draft` feature) reuse the same `AI_*` config (BYOK); cap generations per workspace over a rolling 24h window with `AI_DRAFT_DAILY_LIMIT` (default `0` = unlimited).
 - **Content Security Policy** — uses `unsafe-inline`/`unsafe-eval` because the UI runs Alpine.js + inline htmx; output is auto-escaped (`hono/html`), so CSP here is defence-in-depth, not the primary XSS control.
 - **Meta `appsecret_proof`** — not sent by default. If you enable *Require app secret* in your Meta App, add it to the Graph API calls (`HMAC-SHA256(page_token, META_APP_SECRET)`).
 - **Channel uniqueness** — each connected account belongs to exactly one workspace: a partial unique index allows at most one active channel per `(platform, platform_id)` instance-wide, so incoming events route to a single owner. Connecting an account already live in another workspace is refused. The migration that adds this index automatically disables any pre-existing cross-workspace duplicate (keeping the earliest-connected), so upgrades never fail.
@@ -665,7 +631,7 @@ npm run test:integration  # Vitest integration (needs a Postgres; set TEST_DATAB
 - [x] Comment automation -- public reply + private DM (first-touch), Facebook & Instagram
 - [x] Story reply/mention and emoji reaction triggers
 - [x] Optional AI rephrasing of replies (OpenAI-compatible)
-- [x] AI-drafted replies (PRO) -- auto on no-rule-match + on-demand, human-approved from the inbox (BYOK)
+- [x] AI-drafted replies  -- auto on no-rule-match + on-demand, human-approved from the inbox (BYOK)
 - [x] Drip sequences with delays
 - [x] Contacts CRM with tags and search
 - [x] API key management + token refresh
