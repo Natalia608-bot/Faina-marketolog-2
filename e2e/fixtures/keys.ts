@@ -59,12 +59,12 @@ export function signToken(claims: E2EClaims): string {
 }
 
 /** A maximal-unlock PRO token: tier business + all three product areas → every feature, incl.
- *  multi_workspace (business-only). product must match LICENSE_PRODUCT_SLUG (poststack). */
+ *  multi_workspace (business-only). product must match LICENSE_PRODUCT_SLUG (faina). */
 export function mintProToken(now = Math.floor(Date.now() / 1000)): string {
   return signToken({
     v: 1,
     kid: E2E_KID,
-    product: "poststack",
+    product: "faina",
     email: "e2e@example.com",
     order: "ord_e2e_pro",
     tier: "business",
