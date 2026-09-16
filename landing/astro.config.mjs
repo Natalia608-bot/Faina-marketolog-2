@@ -4,7 +4,7 @@ import tailwindcss from "@tailwindcss/vite";
 
 // https://astro.build
 export default defineConfig({
-  site: "https://poststack.techskills.academy",
+  site: "https://faina.techskills.academy",
   output: "static",
   integrations: [sitemap()],
   vite: {
