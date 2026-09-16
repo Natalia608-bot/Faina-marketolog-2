@@ -1,28 +1,28 @@
 #!/usr/bin/env node
-// Reference importer: a scheduler CSV (Buffer / Hootsuite / Later / Publer / SocialBee) -> PostStack.
+// Reference importer: a scheduler CSV (Buffer / Hootsuite / Later / Publer / SocialBee) -> Faina.
 // For each row it creates editorial content, a post, then schedules/publishes it. Rows that fail
 // validation are skipped and reported; a stable sourceRef per row makes re-runs idempotent.
 //
 // Plain Node 18+ (built-in fetch), no dependencies. This is an example you own and adapt — not a
 // product feature with a support contract. See docs/migration/from-buffer.md.
 //
-//   export POSTSTACK_URL="https://your-instance"
-//   export POSTSTACK_KEY="sk_live_your_key"
-//   export POSTSTACK_CHANNEL_ID="<channelId>"   # default channel to publish to
+//   export FAINA_URL="https://your-instance"
+//   export FAINA_KEY="sk_live_your_key"
+//   export FAINA_CHANNEL_ID="<channelId>"   # default channel to publish to
 //   node import-scheduled-posts.mjs path/to/export.csv
 //
 // Required API-key permissions: content:write, posts:write. The script does not list channels, so it
-// does not require channels:read when POSTSTACK_CHANNEL_ID is supplied directly.
+// does not require channels:read when FAINA_CHANNEL_ID is supplied directly.
 
 import { readFile } from "node:fs/promises";
 
-const BASE = process.env.POSTSTACK_URL;
-const KEY = process.env.POSTSTACK_KEY;
-const CHANNEL_ID = process.env.POSTSTACK_CHANNEL_ID;
+const BASE = process.env.FAINA_URL;
+const KEY = process.env.FAINA_KEY;
+const CHANNEL_ID = process.env.FAINA_CHANNEL_ID;
 const FILE = process.argv[2];
 
 if (!BASE || !KEY || !CHANNEL_ID || !FILE) {
-  console.error("Set POSTSTACK_URL, POSTSTACK_KEY, POSTSTACK_CHANNEL_ID and pass a CSV path.");
+  console.error("Set FAINA_URL, FAINA_KEY, FAINA_CHANNEL_ID and pass a CSV path.");
   process.exit(1);
 }
 
