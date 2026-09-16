@@ -1,8 +1,8 @@
-# AGENTS.md - PostStack
+# AGENTS.md - Faina
 
 ## Project Overview
 
-**PostStack** — self-hosted, source-available multi-channel social media management platform
+**Faina** — self-hosted, source-available multi-channel social media management platform
 (Facebook, Instagram, YouTube, Telegram + Gmail reply/inbox; extensible via the provider pattern):
 publishing & scheduling + inbox auto-replies + drip sequences + CRM.
 **Elastic License 2.0** (source-available, NOT open-source/AGPL — see LICENSE + CLA.md).
@@ -70,16 +70,16 @@ domain or Cloudflare Pages. It is **built into the app Docker image** and served
 - `src/server/routes/landing.ts` (`serveLandingFile`) serves it at `/` and `/privacy` (+ `/_astro/*`).
   Logged-out visitors see the marketing site; logged-in visitors are redirected to `/overview`.
 
-**So the landing and the app are one deployment, on one domain (`poststack.techskills.academy`).**
+**So the landing and the app are one deployment, on one domain (`Faina.techskills.academy`).**
 To ship landing changes, **cut a normal app release** (bump version → tag `v*` → `release.yml` builds the
 image incl. the fresh `landing/dist` → auto-deploy TEST → manual PROD). There is no CF Pages step and no
-DNS cutover. (The `app.poststack.techskills.academy` split mentioned in some marketing copy was an
+DNS cutover. (The `app.faina.techskills.academy` split mentioned in some marketing copy was an
 abandoned plan — a cert issue on the subdomain — so the app currently lives on the apex; treat any
 "app on a subdomain / deploys independently" wording as stale.)
 
 ## API-First Design
 
-PostStack is API-first for operational data and automation at `/api/v1/*`. Interactive channel
+Faina is API-first for operational data and automation at `/api/v1/*`. Interactive channel
 connection and reconnection remain logged-in dashboard flows at `/api/oauth/*`.
 
 - **Dual auth:** session JWT cookie (dashboard) + `Authorization: Bearer sk_live_<key>` (external, prefix from `BRAND.idPrefix`)
