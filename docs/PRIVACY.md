@@ -1,6 +1,6 @@
 # Telemetry & privacy
 
-PostStack sends a small, **anonymous** usage report to the maintainer once per day.
+Faina sends a small, **anonymous** usage report to the maintainer once per day.
 It contains aggregate counts and deployment shape only — never your message content,
 contact data, tokens, or domain. This document describes exactly what is sent, what is
 not, why, and how to turn it off.
@@ -70,11 +70,11 @@ of it can be tied back to a person or a domain.
 Set this environment variable and restart:
 
 ```bash
-POSTSTACK_TELEMETRY_DISABLED=true
+FAINA_TELEMETRY_DISABLED=true
 ```
 
 With telemetry disabled, **no report is ever built and nothing is sent** (no network call
-at all). The equivalent `POSTSTACK_TELEMETRY_ENABLED=false` also works.
+at all). The equivalent `FAINA_TELEMETRY_ENABLED=false` also works.
 
 If you would rather keep telemetry on but send it to your **own** receiver instead of the
 maintainer's, repoint the endpoint:
