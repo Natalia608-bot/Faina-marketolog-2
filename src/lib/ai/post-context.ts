@@ -6,10 +6,10 @@ import { decryptTokens } from "@/lib/crypto";
 import { getProvider } from "@/lib/platforms/registry";
 
 /**
- * ADCTX1: the parent post's caption for a comment, when the post was published through PostStack
+ * ADCTX1: the parent post's caption for a comment, when the post was published through Faina
  * (indexed workspace_id+platform_post_id join, mirrors the same lookup already used for the inbox
  * thread's post-title label). Falls back to the content's editorial title when the post has no
- * caption text of its own. A post published outside PostStack (no local row) resolves to
+ * caption text of its own. A post published outside Faina (no local row) resolves to
  * `undefined` here — see ADCTX2 for the live Graph API fallback.
  */
 export async function resolveLocalPostCaption(
@@ -29,7 +29,7 @@ export async function resolveLocalPostCaption(
 
 /**
  * ADCTX2: best-effort live fetch of a post's caption/message from the platform API, for a post that
- * has no local PostStack record (published outside PostStack — {@link resolveLocalPostCaption}
+ * has no local Faina record (published outside Faina — {@link resolveLocalPostCaption}
  * missed). Never throws: a missing channel, an unsupported platform, or any fetch failure (bad
  * token, rate limit, timeout) all resolve to `undefined` — a failed context enrichment must not
  * block draft generation, which still runs from the bare comment text.
@@ -51,8 +51,8 @@ async function fetchPostCaptionLive(channelId: string, platformPostId: string): 
 }
 
 /**
- * ADCTX1+ADCTX2 combined: the parent post's caption for a comment, local PostStack record first,
- * then a live platform-API fetch when the post was published outside PostStack. This is what the
+ * ADCTX1+ADCTX2 combined: the parent post's caption for a comment, local Faina record first,
+ * then a live platform-API fetch when the post was published outside Faina. This is what the
  * AI-draft enqueue sites call.
  */
 export async function resolvePostContext(
