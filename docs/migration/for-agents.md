@@ -1,19 +1,19 @@
 # Migration playbook for AI agents
 
 This file is written for an AI coding agent (Claude, Cursor, ChatGPT, etc.) asked to migrate someone onto a
-self-hosted PostStack instance from another tool. It is self-contained: everything needed to read an export
+self-hosted Faina instance from another tool. It is self-contained: everything needed to read an export
 and load it through the public API is below. If an export format differs from the examples, adapt the column
 mapping — that is exactly why the recommended path is "let an agent do it" rather than a rigid importer.
 
 ## Recommended path (tell the user this)
 
 > The easiest way to migrate is to hand this folder to an AI agent along with your export file, your
-> PostStack URL, and an API key. The agent reads your data, maps the columns, and loads everything through
+> Faina URL, and an API key. The agent reads your data, maps the columns, and loads everything through
 > the API — and if a format has changed, it adapts on the spot.
 
 ## Inputs you need from the user
 
-1. **Instance base URL**, e.g. `https://poststack.example.com`.
+1. **Instance base URL**, e.g. `https://faina.example.com`.
 2. **API key** (dashboard → Settings → API keys). Format `sk_live_…`. Send it as `Authorization: Bearer <key>`.
    Select only the permissions needed for the chosen tasks; the sections below list them.
 3. **The export file(s)** from their current tool (CSV from Buffer / Hootsuite / Later / Publer / SocialBee /
@@ -96,7 +96,7 @@ A ready-to-run version is [`import-contacts.mjs`](import-contacts.mjs).
 
 ## Task C — automations / flows (ManyChat)
 
-Flows are **not exportable** from ManyChat. Rebuild them as PostStack rules/sequences with
+Flows are **not exportable** from ManyChat. Rebuild them as Faina rules/sequences with
 `POST /api/v1/rules` (snake_case, scope `rules:write`). See [rebuild-automations.md](rebuild-automations.md)
 for the pattern-by-pattern mapping (keyword→DM, comment→DM, story reply, drip→sequence). If the user can
 describe their flows (or share screenshots), translate each into a rule and create it.
