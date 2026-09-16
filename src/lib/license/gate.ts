@@ -26,9 +26,8 @@ export interface LicenseState {
 }
 
 /**
- * The features entitled by a license: a feature is granted only when the tier meets its minTier AND
+
  * its area is entitled (core is always entitled). Area entitlement is token-derived (deriveProducts),
- * NOT registry-derived — so lowering a feature's minTier in the registry alone never unlocks a
  * publishing/replies feature whose area the verified token doesn't grant. Pure + exported for tests.
  */
 export function entitledFeatures(tier: string | null, products: Set<Area>): Set<Feature> {
@@ -40,11 +39,6 @@ export function entitledFeatures(tier: string | null, products: Set<Area>): Set<
   return out;
 }
 
-/**
- * Areas a verified token entitles. An explicit `products` claim is authoritative (the signed token
- * decides); otherwise derive from the product slug; otherwise all-access (current/legacy tokens with
- * neither → zero behaviour change on day one). `core` is always included.
- */
 export function deriveProducts(claims: Claims): Set<Area> {
   if (claims.products && claims.products.length) {
     const s = new Set<Area>(["core"]);
