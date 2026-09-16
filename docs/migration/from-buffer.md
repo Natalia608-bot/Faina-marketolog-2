@@ -1,6 +1,6 @@
 # Migrating scheduled posts (Buffer, Hootsuite, Later, Publer, SocialBee)
 
-All of these tools let you export your content calendar as a CSV. PostStack imports it through three public
+All of these tools let you export your content calendar as a CSV. Faina imports it through three public
 API calls per post. Publishing itself has no additional plan gate, but this API-based migration requires a
 plan with API access.
 
@@ -28,7 +28,7 @@ Date,Time,Caption,Media URL,Channel
 2026-07-02,17:00,"Behind the scenes ",https://example.com/img2.jpg,Facebook
 ```
 
-## 2. Map a channel name to a PostStack channel id
+## 2. Map a channel name to a Faina channel id
 
 List your connected channels and note the `id` you want each row to publish to:
 
@@ -89,15 +89,15 @@ curl -s -X POST https://your-instance/api/v1/posts/<postId>/publish \
 skipping rows that fail validation and reporting them. Plain Node 18+, no dependencies:
 
 ```bash
-export POSTSTACK_URL="https://your-instance"
-export POSTSTACK_KEY="sk_live_your_key"
-export POSTSTACK_CHANNEL_ID="<channelId>"   # default channel for the import
+export FAINA_URL="https://your-instance"
+export FAINA_KEY="sk_live_your_key"
+export FAINA_CHANNEL_ID="<channelId>"   # default channel for the import
 node docs/migration/import-scheduled-posts.mjs path/to/your-export.csv
 ```
 
 ## Field mapping reference
 
-| CSV column | PostStack field | Notes |
+| CSV column | Faina field | Notes |
 |------------|-----------------|-------|
 | Caption / Message / Text | `description` (post) + `baseDescription` (content) | |
 | Date + Time (+ Timezone) | `scheduledDate` | Combine and send as ISO 8601 **UTC**. |
