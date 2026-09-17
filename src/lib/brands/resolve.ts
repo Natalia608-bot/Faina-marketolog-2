@@ -11,6 +11,7 @@ export const EDITORIAL_PLATFORMS = [
   "tiktok",
   "youtube",
   "threads",
+  "telegram",
   "x",
   "linkedin",
 ] as const;
