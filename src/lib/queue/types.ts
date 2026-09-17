@@ -288,6 +288,7 @@ export interface AiDraftJob {
   commentId?: string;
   /** How the resulting approval is labelled (no rule fired): `ai_auto` (pipeline) or `ai_manual`. */
   source: "ai_auto" | "ai_manual";
+  draftText?: string;
 }
 
 export interface AiBatchItem {
