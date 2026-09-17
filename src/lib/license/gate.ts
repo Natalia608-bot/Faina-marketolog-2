@@ -174,6 +174,26 @@ export async function getInstanceLicense(opts: RefreshOpts = {}): Promise<Licens
   return refreshLicense(opts);
 }
 
+export async function getInstanceLicense(opts: RefreshOpts = {}): Promise<LicenseState> {
+  if (env.LICENSE_BYPASS) {
+    const products = new Set<Area>(AREAS);
+
+    return {
+      status: "active",
+      tier: "pro",
+      features: entitledFeatures("pro", products),
+      products,
+      expiresAt: null,
+      source: "env",
+      upgradeUrl: "",
+    };
+  }
+
+  if (cache && nowMsImpl() - cache.at < CACHE_TTL_MS) return cache.state;
+  return refreshLicense(opts);
+}
+
+
 export async function hasFeature(feature: Feature, opts?: RefreshOpts): Promise<boolean> {
   return (await getInstanceLicense(opts)).features.has(feature);
 }
