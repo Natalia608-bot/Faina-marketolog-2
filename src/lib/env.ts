@@ -112,6 +112,11 @@ const envSchema = z.object({
   LICENSE_KEY: z.string().default(""),
   // Seller-scoped JWKS endpoint (TSA seller baked into the URL — this is what binds
   // tokens to the seller; claims carry no seller field).
+  LICENSE_BYPASS: z
+    .string()
+    .default("false")
+    .transform((v) => ["true", "1", "yes", "on"].includes(v.trim().toLowerCase())),
+
   LICENSE_JWKS_URL: z
     .string()
     .url()
