@@ -188,7 +188,6 @@ export async function getInstanceLicense(opts: RefreshOpts = {}): Promise<Licens
   return refreshLicense(opts);
 }
 
-
 export async function hasFeature(feature: Feature, opts?: RefreshOpts): Promise<boolean> {
   return (await getInstanceLicense(opts)).features.has(feature);
 }
