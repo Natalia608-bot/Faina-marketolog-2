@@ -56,6 +56,7 @@ export async function addJobTx<T extends TaskName>(
       max_attempts => ${maxAttempts},
       job_key => ${opts.jobKey ?? null},
       run_at => ${opts.runAt ?? null}
+      job_key_mode => ${opts.jobKeyMode ?? null}
     )
   `);
 }
