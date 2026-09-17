@@ -170,11 +170,6 @@ function cacheState(state: LicenseState): LicenseState {
 }
 
 export async function getInstanceLicense(opts: RefreshOpts = {}): Promise<LicenseState> {
-  if (cache && nowMsImpl() - cache.at < CACHE_TTL_MS) return cache.state;
-  return refreshLicense(opts);
-}
-
-export async function getInstanceLicense(opts: RefreshOpts = {}): Promise<LicenseState> {
   if (env.LICENSE_BYPASS) {
     const products = new Set<Area>(AREAS);
 
