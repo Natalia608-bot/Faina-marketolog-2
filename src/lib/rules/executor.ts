@@ -406,47 +406,102 @@ async function enqueueAiDraftOnNoMatch(input: {
   postId?: string;
   eventKey: string;
 }): Promise<void> {
-  const { workspaceId, channelId, conversationId, contactId, recipientPlatformId, text, eventType, commentId, postId, eventKey } = input;
+  const {
+    workspaceId,
+    channelId,
+    conversationId,
+    contactId,
+    recipientPlatformId,
+    text,
+    eventType,
+    commentId,
+    postId,
+    eventKey,
+  } = input;
+
   const incomingText = text?.trim();
-  if (!incomingText) return; // nothing for the model to reply to
+
+  if (!incomingText) return;
 
   const channel = await db.query.channels.findFirst({
     where: eq(channels.id, channelId),
-    columns: { ai_draft_dm_enabled: true, ai_draft_public_enabled: true },
+    columns: {
+      ai_draft_dm_enabled: true,
+      ai_draft_public_enabled: true,
+    },
   });
+
   if (!channel) return;
 
   let target: "dm" | "public" | "both";
+
   if (eventType === "comment") {
-    if (!channel.ai_draft_dm_enabled && !channel.ai_draft_public_enabled) return;
-    target = channel.ai_draft_dm_enabled && channel.ai_draft_public_enabled ? "both" : channel.ai_draft_dm_enabled ? "dm" : "public";
+    if (
+      !channel.ai_draft_dm_enabled &&
+      !channel.ai_draft_public_enabled
+    ) {
+      return;
+    }
+
+    target =
+      channel.ai_draft_dm_enabled &&
+      channel.ai_draft_public_enabled
+        ? "both"
+        : channel.ai_draft_dm_enabled
+          ? "dm"
+          : "public";
   } else {
     if (!channel.ai_draft_dm_enabled) return;
+
     target = "dm";
   }
 
-  // ADCTX1+ADCTX2+ADCTX3: post caption (comment threads only) + recent conversation history, as ONE
-  // context string — the exact same builder the on-demand "Generate reply" button uses (dashboard.ts),
-  // so the auto pipeline and the on-demand button can never construct context differently.
-  const context = await buildDraftContext({ workspaceId, channelId, conversationId, isComment: eventType === "comment", postId });
+  const context = await buildDraftContext({
+    workspaceId,
+    channelId,
+    conversationId,
+    isComment: eventType === "comment",
+    postId,
+  });
 
+  /*
+   * Graphile batch job:
+   *
+   * first event:
+   *   schedule ai-batch for +3h
+   *
+   * next events during those 3h:
+   *   append to the SAME batch
+   *   preserve original run_at
+   *
+   * Result:
+   *   one AI request for everything accumulated.
+   */
   await addJobTx(
     db,
-    "ai-draft",
+    "ai-batch",
+    [
+      {
+        workspaceId,
+        channelId,
+        conversationId,
+        contactId,
+        recipientPlatformId,
+        incomingText,
+        isComment: eventType === "comment",
+        target,
+        ...(eventType === "comment" && commentId
+          ? { commentId }
+          : {}),
+        ...(context ? { context } : {}),
+        eventKey,
+      },
+    ],
     {
-      workspaceId,
-      channelId,
-      conversationId,
-      contactId,
-      recipientPlatformId,
-      incomingText,
-      isComment: eventType === "comment",
-      target,
-      ...(eventType === "comment" && commentId ? { commentId } : {}),
-      ...(context ? { context } : {}),
-      source: "ai_auto",
+      jobKey: `ai-batch:${workspaceId}`,
+      jobKeyMode: "preserve_run_at",
+      runAt: new Date(Date.now() + 3 * 60 * 60 * 1000),
     },
-    { jobKey: `ai-draft:${eventKey}` },
   );
 }
 
