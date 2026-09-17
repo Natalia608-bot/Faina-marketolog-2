@@ -19,6 +19,7 @@ import { processPublish } from "@/lib/deliveries/publish-worker";
 import { processEventDispatch, processWebhookDelivery } from "@/lib/webhooks/dispatch";
 import { processAiDraft } from "@/lib/workers/ai-draft-worker";
 import type { TaskPayloadMap } from "./types";
+import { processAiBatch } from "@/lib/workers/ai-batch-worker";
 
 /**
  * The graphile-worker task registry. Each task identifier maps to its handler;
@@ -64,5 +65,7 @@ export function createTaskList(): TaskList {
     "webhook-delivery": (p, h) =>
       processWebhookDelivery(p as TaskPayloadMap["webhook-delivery"], h),
     "ai-draft": (p, h) => processAiDraft(p as TaskPayloadMap["ai-draft"], h),
+    "ai-batch": (p, h) =>
+      processAiBatch(p as TaskPayloadMap["ai-batch"], h),
   };
 }
