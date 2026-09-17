@@ -1,4 +1,3 @@
-```ts
 import { spawn } from "bun";
 
 const children = [
@@ -56,4 +55,3 @@ const results = await Promise.all(
 console.error("[start] child process exited:", results);
 
 process.exit(1);
-```
