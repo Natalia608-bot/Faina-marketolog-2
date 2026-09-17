@@ -33,6 +33,8 @@ async function telegramRequest(
   method: string,
   body: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
+  console.log(`[telegram] API request: ${method}`);
+
   const res = await fetch(telegramUrl(token, method), {
     method: "POST",
     headers: {
@@ -49,10 +51,16 @@ async function telegramRequest(
   };
 
   if (!res.ok || !json.ok) {
+    console.error(
+      `[telegram] API error: ${method} HTTP=${res.status} description=${json.description ?? "unknown"}`,
+    );
+
     throw new PermanentError(
       `telegram: ${json.description ?? `HTTP ${res.status}`}`,
     );
   }
+
+  console.log(`[telegram] API success: ${method}`);
 
   return json.result ?? {};
 }
@@ -68,6 +76,8 @@ export const telegramProvider: Provider = {
   requiresTokenRefresh: () => false,
 
   async healthCheck(tokens: TokenSet): Promise<AccountInfo> {
+    console.log("[telegram] healthCheck");
+
     const result = await telegramRequest(tokens.accessToken, "getMe", {});
 
     const id = String(result.id ?? "");
@@ -102,6 +112,10 @@ export const telegramProvider: Provider = {
     mediaUrls,
     channelMetadata,
   }): Promise<PublishHandle> {
+    console.log(
+      `[telegram] publish start: format=${request.format} accountId=${accountId}`,
+    );
+
     const chatId =
       typeof channelMetadata?.chatId === "string"
         ? channelMetadata.chatId
@@ -113,7 +127,11 @@ export const telegramProvider: Provider = {
       );
     }
 
+    console.log(`[telegram] publish target chatId=${chatId}`);
+
     if (request.format === "text") {
+      console.log("[telegram] sending text");
+
       const result = await telegramRequest(
         tokens.accessToken,
         "sendMessage",
@@ -131,6 +149,10 @@ export const telegramProvider: Provider = {
         );
       }
 
+      console.log(
+        `[telegram] PUBLISHED text message_id=${messageId}`,
+      );
+
       return {
         providerHandle: messageId,
       };
@@ -144,6 +166,8 @@ export const telegramProvider: Provider = {
           "telegram: image publishing requires media URL",
         );
       }
+
+      console.log("[telegram] sending photo");
 
       const result = await telegramRequest(
         tokens.accessToken,
@@ -164,6 +188,10 @@ export const telegramProvider: Provider = {
           "telegram: sendPhoto returned no message_id",
         );
       }
+
+      console.log(
+        `[telegram] PUBLISHED photo message_id=${messageId}`,
+      );
 
       return {
         providerHandle: messageId,
