@@ -16,7 +16,6 @@ providers.register(tiktokProvider);
 providers.register(xProvider);
 providers.register(linkedinProvider);
 providers.register(threadsProvider);
-providers.register(threadsProvider);
 providers.register(telegramProvider);
 
 import { getProvider, isProvider } from "./registry";
