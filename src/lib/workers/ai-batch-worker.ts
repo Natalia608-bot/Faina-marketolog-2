@@ -290,6 +290,7 @@ export async function processAiBatch(
           ...(item.context ? { context: item.context } : {}),
           source: "ai_auto",
           draftText: draft,
+          draftText?: string;
         },
         {
           jobKey: `ai-draft:${item.eventKey}`,
