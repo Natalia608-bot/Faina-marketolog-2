@@ -290,6 +290,22 @@ export interface AiDraftJob {
   source: "ai_auto" | "ai_manual";
 }
 
+export interface AiBatchItem {
+  workspaceId: string;
+  channelId: string;
+  conversationId: string;
+  contactId: string;
+  recipientPlatformId: string;
+  incomingText: string;
+  isComment: boolean;
+  target: "dm" | "public" | "both";
+  commentId?: string;
+  context?: string;
+  eventKey: string;
+}
+
+export type AiBatchJob = AiBatchItem[];
+
 /** graphile-worker task identifiers → their payload type. */
 export type TaskPayloadMap = {
   "incoming-message": IncomingMessageJob;
@@ -312,6 +328,7 @@ export type TaskPayloadMap = {
   "event-dispatch": EventDispatchJob;
   "webhook-delivery": WebhookDeliveryJob;
   "ai-draft": AiDraftJob;
+  "ai-batch": AiBatchJob;
 };
 
 export type TaskName = keyof TaskPayloadMap;
