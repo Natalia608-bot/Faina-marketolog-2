@@ -12,7 +12,7 @@
   "scripts": {
     "dev": "bun --watch src/server/index.ts",
     
-    "start": "bun src/start.ts"
+    "start": "bun src/start.ts",
     "build": "tsc --noEmit",
     "lint": "eslint . --max-warnings 0",
     "typecheck": "tsc --noEmit",
