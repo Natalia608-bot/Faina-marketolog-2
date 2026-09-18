@@ -20,8 +20,31 @@ const corsMiddleware = cors({
   allowHeaders: ["Content-Type", "Authorization", "Idempotency-Key"],
 });
 
+function cronTokenIsValid(c: any): boolean {
+  const expected = process.env.CRON_TOKEN;
+
+  if (!expected) {
+    console.error("[CRON] CRON_TOKEN is not configured");
+    return false;
+  }
+
+  const token = c.req.query("token");
+
+  return token === expected;
+}
+
 export function buildApp(): Hono {
   const app = new Hono();
+
+  app.get("/wake", (c) => {
+  if (!cronTokenIsValid(c)) {
+    return c.text("Unauthorized", 401);
+  }
+
+  console.log("[CRON] Faina wake request received");
+
+  return c.text("Faina wake OK", 200);
+});
 
   app.use("*", securityHeaders());
   app.use("/api/v1", corsMiddleware);
