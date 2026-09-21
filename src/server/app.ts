@@ -91,6 +91,25 @@ export function buildApp(): Hono {
     console.log("[CRON] Faina wake request received");
     return c.text("Faina wake OK", 200);
   });
+
+    app.get("/wake", (c) => {
+    const expected = process.env.CRON_TOKEN;
+
+    if (!expected) {
+      console.error("[CRON] CRON_TOKEN is not configured");
+      return c.text("Unauthorized", 401);
+    }
+
+    const token = c.req.query("token");
+
+    if (token !== expected) {
+      console.warn("[CRON] Invalid wake token");
+      return c.text("Unauthorized", 401);
+    }
+
+    console.log("[CRON] Faina wake request received");
+    return c.text("Faina wake OK", 200);
+  });
   
   // Unmatched routes: branded HTML 404 for pages; JSON contract for the API.
   app.notFound((c) => {
