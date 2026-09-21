@@ -21,7 +21,7 @@ const corsMiddleware = cors({
 });
 
 function cronTokenIsValid(c: any): boolean {
-  const expected = process.env.CRON_TOKEN;
+  const expected = process.env.CRON_SECRET;
 
   if (!expected) {
     console.error("[CRON] CRON_TOKEN is not configured");
