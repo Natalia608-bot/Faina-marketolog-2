@@ -1654,7 +1654,11 @@ export function registerDashboard(app: Hono, sessionGuard: MiddlewareHandler): v
   // page reloads (HX-Redirect); on failure a small inline error is returned (no list — the list lives
   // on the dedicated /channels page now).
   app.post("/channels/connect-token", guard, async (c) => {
-    const res = await channelConnectToken.POST(c.req.raw);
+    const form = await c.req.parseBody();
+    const res = await channelConnectToken.POST(jsonReq(c, {
+      platform: String(form.platform ?? ""),
+      token: String(form.token ?? ""),
+    }));
     const a = await auth(c);
     if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
     if (res.status >= 400) {
@@ -1666,7 +1670,10 @@ export function registerDashboard(app: Hono, sessionGuard: MiddlewareHandler): v
   });
 
   app.post("/channels/telegram/connect", guard, async (c) => {
-    const res = await channelTelegram.POST(c.req.raw);
+    const form = await c.req.parseBody();
+    const res = await channelTelegram.POST(jsonReq(c, {
+      token: String(form.token ?? ""),
+    }));
     const a = await auth(c);
     if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
     if (res.status >= 400) {
