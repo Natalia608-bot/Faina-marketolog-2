@@ -475,7 +475,7 @@ async function channelsPage(c: Context): Promise<Response> {
               </div>
             </div>
             <div class="cred-subhead">Connect a token manually</div>
-            <form class="connect-form" hx-post="/channels/connect-token" hx-target="#channels-toast" hx-swap="innerHTML">
+            <form class="connect-form" hx-post="/channels/connect-token" hx-ext="json-enc" hx-target="#channels-toast" hx-swap="innerHTML">
               <select name="platform" aria-label="Platform"><option value="facebook">Facebook</option><option value="instagram">Instagram</option></select>
               <input class="input" name="token" placeholder="paste long-lived / System User token" required />
               <button class="btn btn-primary btn-sm" type="submit">Connect</button>
