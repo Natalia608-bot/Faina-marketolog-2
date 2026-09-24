@@ -24,27 +24,37 @@ function cronTokenIsValid(c: any): boolean {
   const expected = process.env.CRON_SECRET;
 
   if (!expected) {
-    console.error("[CRON] CRON_TOKEN is not configured");
+    console.error("[CRON] CRON_SECRET is not configured");
     return false;
   }
 
   const token = c.req.query("token");
 
-  return token === expected;
+  if (token !== expected) {
+    console.warn("[CRON] Invalid wake token");
+    return false;
+  }
+
+  return true;
 }
 
 export function buildApp(): Hono {
   const app = new Hono();
 
+  // External cron only keeps Render awake.
+  // It does NOT start the worker or trigger any marketing task.
   app.get("/wake", (c) => {
-  if (!cronTokenIsValid(c)) {
-    return c.text("Unauthorized", 401);
-  }
+    console.log("[CRON] /wake request received");
 
-  console.log("[CRON] Faina wake request received");
+    if (!cronTokenIsValid(c)) {
+      console.warn("[CRON] /wake unauthorized");
+      return c.text("Unauthorized", 401);
+    }
 
-  return c.text("Faina wake OK", 200);
-});
+    console.log("[CRON] /wake OK — Faina is awake");
+
+    return c.text("OK", 200);
+  });
 
   app.use("*", securityHeaders());
   app.use("/api/v1", corsMiddleware);
@@ -59,58 +69,35 @@ export function buildApp(): Hono {
       if (e instanceof ProRequiredError) {
         return ApiErrors.proRequired(e.feature, env.LICENSE_UPGRADE_URL, e.message);
       }
+
       // A tier count-limit (e.g. too many API keys on free) is also a 402.
       if (e instanceof LimitExceededError) {
         return ApiErrors.proRequired(e.kind, env.LICENSE_UPGRADE_URL, e.message);
       }
+
       // A service-layer ApiError (ported publishing code) carries its own code/status/details.
       if (e instanceof ApiError) {
         return apiErrorResponse(e);
       }
-      console.error(`Unhandled API error on ${c.req.method} ${sanitizeForLog(c.req.path)}: ${sanitizeForLog(e instanceof Error ? e.message : String(e))}`);
+
+      console.error(
+        `Unhandled API error on ${c.req.method} ${sanitizeForLog(c.req.path)}: ${sanitizeForLog(
+          e instanceof Error ? e.message : String(e)
+        )}`
+      );
+
       return ApiErrors.internal();
     }
-    console.error(`Unhandled error: ${sanitizeForLog(e instanceof Error ? e.message : String(e))}`);
+
+    console.error(
+      `Unhandled error: ${sanitizeForLog(
+        e instanceof Error ? e.message : String(e)
+      )}`
+    );
+
     return c.html(errorPage(500), 500);
   });
-  app.get("/wake", (c) => {
-    const expected = process.env.CRON_TOKEN;
 
-    if (!expected) {
-      console.error("[CRON] CRON_TOKEN is not configured");
-      return c.text("Unauthorized", 401);
-    }
-
-    const token = c.req.query("token");
-
-    if (token !== expected) {
-      console.warn("[CRON] Invalid wake token");
-      return c.text("Unauthorized", 401);
-    }
-
-    console.log("[CRON] Faina wake request received");
-    return c.text("Faina wake OK", 200);
-  });
-
-    app.get("/wake", (c) => {
-    const expected = process.env.CRON_TOKEN;
-
-    if (!expected) {
-      console.error("[CRON] CRON_TOKEN is not configured");
-      return c.text("Unauthorized", 401);
-    }
-
-    const token = c.req.query("token");
-
-    if (token !== expected) {
-      console.warn("[CRON] Invalid wake token");
-      return c.text("Unauthorized", 401);
-    }
-
-    console.log("[CRON] Faina wake request received");
-    return c.text("Faina wake OK", 200);
-  });
-  
   // Unmatched routes: branded HTML 404 for pages; JSON contract for the API.
   app.notFound((c) => {
     if (c.req.path.startsWith("/api/")) return ApiErrors.notFound();
@@ -118,14 +105,18 @@ export function buildApp(): Hono {
   });
 
   app.route("/", publicRoutes);
+
   // LANDING1: marketing homepage at `/` (+ its assets). Mounted before `pages` so it owns `/`
   // (which `pages` previously redirected to /overview). Logged-in visitors are redirected onward.
   app.route("/", landingRoutes);
+
   app.route("/", special);
+
   // Inbound integration webhooks (HMAC-authenticated, NOT Bearer-auth) — mounted outside /api/v1 so
   // the API-key middleware does NOT apply. Off by default (requires REELSTACK_WEBHOOK_SECRET +
   // REELSTACK_WEBHOOK_WORKSPACE_ID). Has its own onError (app-level onError only covers /api/).
   app.route("/", integrationsRoutes());
+
   app.route("/api/v1", v1);
   app.route("/", pages);
 
