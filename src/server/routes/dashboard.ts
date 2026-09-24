@@ -1665,8 +1665,7 @@ export function registerDashboard(app: Hono, sessionGuard: MiddlewareHandler): v
       const body = await res.json().catch(() => ({}));
       return c.html(html`<div class="auth-error">${body?.error?.message ?? "Could not connect with this token."}</div>`);
     }
-    c.header("HX-Redirect", "/channels");
-    return c.body(null, 200);
+    return c.redirect("/channels");
   });
 
   app.post("/channels/telegram/connect", guard, async (c) => {
@@ -1680,8 +1679,7 @@ export function registerDashboard(app: Hono, sessionGuard: MiddlewareHandler): v
       const body = await res.json().catch(() => ({}));
       return c.html(html`<div class="auth-error">${body?.error?.message ?? "Could not connect the Telegram bot."}</div>`);
     }
-    c.header("HX-Redirect", "/channels");
-    return c.body(null, 200);
+    return c.redirect("/channels");
   });
 
   // Contacts — the customer CRM; seeing individual people is PRO.
