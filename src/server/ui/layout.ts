@@ -110,8 +110,8 @@ export function renderPage(o: PageOpts): Html {
     ${paletteScript()}
     <script defer src="${ALPINE}"></script>
     <script defer src="${HTMX}"></script>
-    <script defer src="${HTMX_SSE}"></script>
     <script defer src="${HTMX_JSON_ENC}"></script>
+    <script defer src="${HTMX_SSE}"></script>
     <script defer src="${assetUrl("ps-select.js")}"></script>
     <script defer src="${assetUrl("filter-bar.js")}"></script>
   </head>
