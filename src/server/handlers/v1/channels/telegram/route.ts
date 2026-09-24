@@ -23,7 +23,11 @@ export async function POST(request: Request) {
   const auth = await authenticateWithScope(request, "channels:write").catch(() => null);
   if (!auth) return ApiErrors.unauthorized();
 
-  const body = await request.json().catch(() => ({}));
+  const contentType = request.headers.get("content-type") || "";
+
+  const body = contentType.includes("application/json")
+    ? await request.json().catch(() => ({}))
+    : Object.fromEntries(await request.formData());
   const parsed = schema.safeParse(body);
   if (!parsed.success) return ApiErrors.validationError(parsed.error);
 
