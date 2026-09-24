@@ -468,7 +468,7 @@ async function channelsPage(c: Context): Promise<Response> {
                 : ""}
               <div x-show="tg" x-cloak style="margin-top:.75rem">
                 <p class="set-lead" style="margin:0 0 .5rem">In Telegram, message <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a> → <code>/newbot</code> → copy the bot token. We register the webhook for you.</p>
-                <form class="connect-form" method="post" action="/channels/telegram/connect" hx-post="/channels/telegram/connect" hx-target="#channels-toast" hx-swap="innerHTML">
+                <form class="connect-form" method="post" action="/channels/telegram/connect">
                   <input class="input" name="token" placeholder="123456789:AA..." required />
                   <button class="btn btn-primary btn-sm" type="submit">Connect Telegram</button>
                 </form>
