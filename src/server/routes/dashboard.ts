@@ -1659,10 +1659,6 @@ export function registerDashboard(app: Hono, sessionGuard: MiddlewareHandler): v
       platform: String(form.platform ?? ""),
       token: String(form.token ?? ""),
     }));
-    const res = await channelConnectToken.POST(jsonReq(c, {
-      platform: String(form.platform ?? ""),
-      token: String(form.token ?? ""),
-    }));
     const a = await auth(c);
     if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
     if (res.status >= 400) {
@@ -1675,9 +1671,6 @@ export function registerDashboard(app: Hono, sessionGuard: MiddlewareHandler): v
 
   app.post("/channels/telegram/connect", guard, async (c) => {
     const form = await c.req.parseBody();
-    const res = await channelTelegram.POST(jsonReq(c, {
-      token: String(form.token ?? ""),
-    }));
     const res = await channelTelegram.POST(jsonReq(c, {
       token: String(form.token ?? ""),
     }));
