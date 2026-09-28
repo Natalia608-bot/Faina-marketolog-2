@@ -75,7 +75,7 @@ export async function POST(request: Request) {
       eq(channels.platform, "telegram"),
       eq(channels.platform_id, accounts[0].platformId),
     ),
-    columns: { id: true, webhook_secret: true },
+    columns: { id: true, webhook_secret: true, metadata: true },
   });
   try {
     if (!channel?.webhook_secret) throw new Error("channel webhook secret missing after upsert");
@@ -119,6 +119,17 @@ export async function POST(request: Request) {
     targetType: "channel",
     metadata: { platform: "telegram", mode: "manual_token" },
   });
+
+  if (channel && env.CHAT_ID) {
+    await db.update(channels)
+      .set({
+        metadata: {
+          ...((channel.metadata as Record<string, unknown>) ?? {}),
+          chatId: env.CHAT_ID,
+        },
+      })
+      .where(eq(channels.id, channel.id));
+  }
 
   return created({ connected: accounts.length, username: accounts[0].username ?? null });
 }
