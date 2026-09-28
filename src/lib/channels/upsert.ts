@@ -190,6 +190,7 @@ export async function upsertChannels(
             token_expires_at: tokenExpiresAt,
             data_access_expires_at: dataAccessExpiresAt,
             messaging_token_expires_at: messagingTokenExpiresAt,
+            hidden_at: null,
           },
         })
         .returning({ id: channels.id });
