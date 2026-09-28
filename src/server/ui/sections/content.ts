@@ -422,6 +422,10 @@ export function registerContent(r: Hono, guard: MiddlewareHandler): void {
   });
 
   r.post("/content/:id/posts/:postId/publish", guard, async (c) => {
+    console.log("[CONTENT-PUBLISH] route hit", {
+      contentId: c.req.param("id"),
+      postId: c.req.param("postId"),
+    });
     const a = await auth(c);
     if (!a) return c.body(null, 401, { "HX-Redirect": "/login" });
     const { id, postId } = c.req.param();
