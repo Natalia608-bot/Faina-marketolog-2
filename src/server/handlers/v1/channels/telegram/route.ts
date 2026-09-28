@@ -52,20 +52,6 @@ export async function POST(request: Request) {
     { connectionMode: "manual_token", deferDrain: true },
   );
 
-    if (env.CHAT_ID) {
-    await db.update(channels)
-      .set({
-        metadata: { chatId: env.TELEGRAM_CHAT_ID },
-      })
-      .where(
-        and(
-          eq(channels.workspace_id, auth.workspaceId),
-          eq(channels.platform, "telegram"),
-          eq(channels.platform_id, accounts[0].platformId),
-        ),
-      );
-  }
-
   // Register the webhook with the channel's stored secret so incoming updates verify.
   // A bot without a working webhook has a dead inbox — treat failure as a failed
   // connection: flag the channel needs_reauth and report the error.
