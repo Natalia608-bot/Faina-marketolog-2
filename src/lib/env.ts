@@ -1,4 +1,4 @@
-import { z } from "zod";
+import { z } from "zod";META_APP_ID:
 import { isSafeAlertWebhookUrl } from "@/lib/notifications/webhook-url";
 
 // RETAIN1: compaction window. 0 = disabled. If > 0 it must be >= 30 so the only windowed UI read
@@ -85,6 +85,8 @@ const envSchema = z.object({
   // docs + operator gate around this). When > 0, the ai-draft worker skips generation once the
   // rolling-24h count is exhausted (no draft, no approval row).
   AI_DRAFT_DAILY_LIMIT: z.coerce.number().int().min(0).default(0),
+
+  CHAT_ID: z.string().default(""),
 
   // Meta (optional — app starts without them, OAuth won't work until configured)
   META_APP_ID: z.string().default(""),
