@@ -119,7 +119,7 @@ export const telegramProvider: Provider = {
     const chatId =
       typeof channelMetadata?.chatId === "string"
         ? channelMetadata.chatId
-        : accountId;
+        : process.env.CHAT_ID ?? accountId;
 
     if (!chatId) {
       throw new PermanentError(
