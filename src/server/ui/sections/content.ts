@@ -432,6 +432,13 @@ export function registerContent(r: Hono, guard: MiddlewareHandler): void {
     const form = await c.req.parseBody();
     const when = whenFromForm(form);
     const [res] = await publishPosts([postId], when, a.workspaceId);
+
+    console.log("[CONTENT-PUBLISH] result", {
+      postId,
+      when,
+      result: res,
+    });
+    
     const panel = await renderPublishPanel(a.workspaceId, id);
     if (!panel) return c.text("not found", 404);
     if (isHtmx(c)) {
